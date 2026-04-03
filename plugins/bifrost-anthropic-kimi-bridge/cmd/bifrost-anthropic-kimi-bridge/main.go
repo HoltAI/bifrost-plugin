@@ -883,16 +883,18 @@ func convertAnthropicMessagesToOpenAI(body map[string]any) map[string]any {
 			continue
 		}
 
-		userTextParts := make([]string, 0)
-		flushUserText := func() {
-			text := strings.TrimSpace(strings.Join(userTextParts, "\n\n"))
-			if text != "" {
+		userContentParts := make([]map[string]any, 0)
+		flushUserContent := func() {
+			if len(userContentParts) == 0 {
+				return
+			}
+			if content := compactOpenAIUserContent(userContentParts); content != nil {
 				openAIMessages = append(openAIMessages, map[string]any{
 					"role":    "user",
-					"content": text,
+					"content": content,
 				})
 			}
-			userTextParts = userTextParts[:0]
+			userContentParts = userContentParts[:0]
 		}
 
 		for _, rawBlock := range contentBlocks {
@@ -902,7 +904,7 @@ func convertAnthropicMessagesToOpenAI(body map[string]any) map[string]any {
 			}
 			switch asString(block["type"]) {
 			case "tool_result":
-				flushUserText()
+				flushUserContent()
 				openAIMessages = append(openAIMessages, map[string]any{
 					"role":         "tool",
 					"tool_call_id": asString(block["tool_use_id"]),
@@ -911,14 +913,21 @@ func convertAnthropicMessagesToOpenAI(body map[string]any) map[string]any {
 			case "thinking":
 				continue
 			default:
+				if part := anthropicBlockToOpenAIContentPart(block); len(part) > 0 {
+					userContentParts = append(userContentParts, part)
+					continue
+				}
 				rendered := strings.TrimSpace(renderAnthropicBlock(block))
 				if rendered != "" {
-					userTextParts = append(userTextParts, rendered)
+					userContentParts = append(userContentParts, map[string]any{
+						"type": "text",
+						"text": rendered,
+					})
 				}
 			}
 		}
 
-		flushUserText()
+		flushUserContent()
 	}
 
 	openAIBody := map[string]any{
@@ -1362,6 +1371,95 @@ func renderAnthropicBlock(block map[string]any) string {
 	default:
 		return ""
 	}
+}
+
+func anthropicBlockToOpenAIContentPart(block map[string]any) map[string]any {
+	switch asString(block["type"]) {
+	case "text":
+		text := asString(block["text"])
+		if text == "" {
+			return nil
+		}
+		return map[string]any{
+			"type": "text",
+			"text": text,
+		}
+	case "image":
+		url := anthropicImageBlockURL(block)
+		if url == "" {
+			return nil
+		}
+		return map[string]any{
+			"type": "image_url",
+			"image_url": map[string]any{
+				"url": url,
+			},
+		}
+	default:
+		return nil
+	}
+}
+
+func anthropicImageBlockURL(block map[string]any) string {
+	source := asMap(block["source"])
+	if len(source) == 0 {
+		return ""
+	}
+
+	switch strings.ToLower(strings.TrimSpace(asString(source["type"]))) {
+	case "base64":
+		mediaType := strings.TrimSpace(asString(source["media_type"]))
+		data := strings.TrimSpace(asString(source["data"]))
+		if mediaType == "" || data == "" {
+			return ""
+		}
+		return "data:" + mediaType + ";base64," + data
+	case "url":
+		return strings.TrimSpace(firstNonEmpty(asString(source["url"]), asString(block["url"])))
+	default:
+		if url := strings.TrimSpace(firstNonEmpty(asString(source["url"]), asString(block["url"]))); url != "" {
+			return url
+		}
+		return ""
+	}
+}
+
+func compactOpenAIUserContent(parts []map[string]any) any {
+	if len(parts) == 0 {
+		return nil
+	}
+
+	textOnly := true
+	textParts := make([]string, 0, len(parts))
+	normalized := make([]map[string]any, 0, len(parts))
+	for _, part := range parts {
+		if len(part) == 0 {
+			continue
+		}
+		switch strings.ToLower(strings.TrimSpace(asString(part["type"]))) {
+		case "text":
+			text := asString(part["text"])
+			if text == "" {
+				continue
+			}
+			textParts = append(textParts, text)
+			normalized = append(normalized, map[string]any{
+				"type": "text",
+				"text": text,
+			})
+		default:
+			textOnly = false
+			normalized = append(normalized, part)
+		}
+	}
+
+	if len(normalized) == 0 {
+		return nil
+	}
+	if textOnly {
+		return strings.TrimSpace(strings.Join(textParts, "\n\n"))
+	}
+	return normalized
 }
 
 func renderToolResultContent(content any) string {
