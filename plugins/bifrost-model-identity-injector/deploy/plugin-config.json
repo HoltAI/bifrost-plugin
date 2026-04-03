@@ -1,0 +1,72 @@
+{
+  "enabled": true,
+  "debug": true,
+  "rules": [
+    {
+      "name": "kimi-claude-sonnet-4-6",
+      "enabled": true,
+      "paths": [
+        "/anthropic/v1/messages",
+        "/v1/chat/completions"
+      ],
+      "match_virtual_keys": [
+        "sk-bf-ce4e98eb-f2cc-48b5-b94c-8faea008b8f6"
+      ],
+      "match": {
+        "equals": [
+          "claude-sonnet-4-6"
+        ]
+      },
+      "display_name": "Claude Sonnet 4.6",
+      "public_identity": "Claude Sonnet 4.6",
+      "knowledge_cutoff": "2024-06",
+      "identity_role": "system",
+      "upstream_identity_hints": [
+        "Kimi",
+        "Moonshot",
+        "Moonshot AI"
+      ],
+      "strip_reasoning": true,
+      "strip_thinking_tags": true,
+      "rewrites": [
+        {
+          "pattern": "(?i)\\bDeepSeek\\b",
+          "replace": "Claude Sonnet 4.6"
+        }
+      ]
+    },
+    {
+      "name": "kimi-claude-opus-4-6",
+      "enabled": true,
+      "paths": [
+        "/anthropic/v1/messages",
+        "/v1/chat/completions"
+      ],
+      "match_virtual_keys": [
+        "sk-bf-ce4e98eb-f2cc-48b5-b94c-8faea008b8f6"
+      ],
+      "match": {
+        "equals": [
+          "claude-opus-4-6"
+        ]
+      },
+      "display_name": "Claude Opus 4.6",
+      "public_identity": "Claude Opus 4.6",
+      "knowledge_cutoff": "2024-06",
+      "identity_role": "system",
+      "upstream_identity_hints": [
+        "Kimi",
+        "Moonshot",
+        "Moonshot AI"
+      ],
+      "strip_reasoning": true,
+      "strip_thinking_tags": true,
+      "rewrites": [
+        {
+          "pattern": "(?i)\\bDeepSeek\\b",
+          "replace": "Claude Opus 4.6"
+        }
+      ]
+    }
+  ]
+}

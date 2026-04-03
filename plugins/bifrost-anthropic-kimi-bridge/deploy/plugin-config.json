@@ -1,0 +1,20 @@
+{
+  "upstream_base_url": "http://172.17.0.1:18080",
+  "chat_completions_path": "/v1/chat/completions",
+  "anthropic_messages_path": "/anthropic/v1/messages",
+  "match_models": [
+    "Kimi-K2.5",
+    "azure/Kimi-K2.5",
+    "claude-sonnet-4-6",
+    "claude-haiku-4-5-20251001"
+  ],
+  "match_substrings": [
+    "__azure-kimi"
+  ],
+  "match_virtual_keys": [
+    "sk-bf-ce4e98eb-f2cc-48b5-b94c-8faea008b8f6"
+  ],
+  "bridge_all_models": false,
+  "timeout_ms": 300000,
+  "debug": true
+}
