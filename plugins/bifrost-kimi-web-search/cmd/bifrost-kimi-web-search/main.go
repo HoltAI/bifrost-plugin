@@ -139,39 +139,44 @@ func HTTPTransportPreHook(ctx *schemas.BifrostContext, req *schemas.HTTPRequest)
 
 	toolNames := extractSearchToolNames(req.Path, body)
 	if len(toolNames) == 0 {
-		debugf("skipping search augmentation for model=%q path=%s: no matching search tools", model, req.Path)
+		debugf("skipping search tool protocol for model=%q path=%s: no matching search tools", model, req.Path)
 		return nil, nil
 	}
 	if hasToolResults(req.Path, body) {
-		debugf("skipping search augmentation for model=%q path=%s: tool results already present", model, req.Path)
+		if normalizePath(req.Path) != "/anthropic/v1/messages" {
+			debugf("skipping search tool result rewrite for model=%q path=%s: unsupported path", model, req.Path)
+			return nil, nil
+		}
+		if !rewriteAnthropicSearchToolResults(body) {
+			debugf("skipping search tool result rewrite for model=%q path=%s: no matching search tool results", model, req.Path)
+			return nil, nil
+		}
+		removeSearchTools(req.Path, body)
+		encoded, err := json.Marshal(body)
+		if err != nil {
+			return nil, err
+		}
+		req.Body = encoded
+		debugf("rewrote client search tool_result into user context model=%q path=%s", model, req.Path)
 		return nil, nil
 	}
 
+	if normalizePath(req.Path) != "/anthropic/v1/messages" {
+		debugf("skipping search tool short-circuit for model=%q path=%s: unsupported path", model, req.Path)
+		return nil, nil
+	}
 	query := latestUserText(req.Path, body)
 	if query == "" {
-		debugf("skipping search augmentation for model=%q path=%s: empty user query", model, req.Path)
+		debugf("skipping search tool short-circuit for model=%q path=%s: empty user query", model, req.Path)
 		return nil, nil
 	}
-
-	results, err := doSearch(query, pluginConfig.MaxResults)
-	if err != nil {
-		debugf("search failed model=%q path=%s query=%q error=%v", model, req.Path, query, err)
+	toolName := firstSearchToolName(req.Path, body)
+	if toolName == "" {
+		debugf("skipping search tool short-circuit for model=%q path=%s: could not resolve tool name", model, req.Path)
 		return nil, nil
 	}
-
-	if !injectSearchResults(req.Path, body, query, results) {
-		debugf("skipping search augmentation for model=%q path=%s: could not inject result payload", model, req.Path)
-		return nil, nil
-	}
-	removeSearchTools(req.Path, body)
-
-	encoded, err := json.Marshal(body)
-	if err != nil {
-		return nil, err
-	}
-	req.Body = encoded
-	debugf("injected server search model=%q path=%s query=%q results=%d", model, req.Path, trimForLog(query), len(results))
-	return nil, nil
+	debugf("returning synthetic tool_use for model=%q path=%s tool=%q query=%q", model, req.Path, toolName, trimForLog(query))
+	return anthropicToolUseResponse(req, model, toolName, query)
 }
 
 func HTTPTransportPostHook(ctx *schemas.BifrostContext, req *schemas.HTTPRequest, resp *schemas.HTTPResponse) error {
@@ -304,6 +309,42 @@ func extractSearchToolNames(path string, body map[string]any) []string {
 	return names
 }
 
+func firstSearchToolName(path string, body map[string]any) string {
+	switch normalizePath(path) {
+	case "/anthropic/v1/messages":
+		if toolChoice := asMap(body["tool_choice"]); strings.EqualFold(asString(toolChoice["type"]), "tool") {
+			name := strings.TrimSpace(asString(toolChoice["name"]))
+			if isSearchToolName(name) {
+				return name
+			}
+		}
+		for _, rawTool := range asSlice(body["tools"]) {
+			tool := asMap(rawTool)
+			name := strings.TrimSpace(asString(tool["name"]))
+			if isSearchToolName(name) {
+				return name
+			}
+		}
+	case "/v1/chat/completions":
+		if toolChoice := asMap(body["tool_choice"]); strings.EqualFold(asString(toolChoice["type"]), "function") {
+			function := asMap(toolChoice["function"])
+			name := strings.TrimSpace(asString(function["name"]))
+			if isSearchToolName(name) {
+				return name
+			}
+		}
+		for _, rawTool := range asSlice(body["tools"]) {
+			tool := asMap(rawTool)
+			function := asMap(tool["function"])
+			name := strings.TrimSpace(asString(function["name"]))
+			if isSearchToolName(name) {
+				return name
+			}
+		}
+	}
+	return ""
+}
+
 func isSearchToolName(name string) bool {
 	name = normalizeToolName(name)
 	if name == "" {
@@ -408,6 +449,116 @@ func extractOpenAIMessageText(content any) string {
 	default:
 		return ""
 	}
+}
+
+func rewriteAnthropicSearchToolResults(body map[string]any) bool {
+	messages := asSlice(body["messages"])
+	if len(messages) == 0 {
+		return false
+	}
+
+	searchToolUseIDs := collectAnthropicSearchToolUseIDs(messages)
+	if len(searchToolUseIDs) == 0 {
+		return false
+	}
+
+	rewrittenMessages := make([]any, 0, len(messages))
+	rewroteAny := false
+	for _, rawMessage := range messages {
+		message := asMap(rawMessage)
+		if len(message) == 0 {
+			rewrittenMessages = append(rewrittenMessages, rawMessage)
+			continue
+		}
+
+		contentBlocks := asSlice(message["content"])
+		if len(contentBlocks) == 0 {
+			rewrittenMessages = append(rewrittenMessages, rawMessage)
+			continue
+		}
+
+		switch strings.ToLower(strings.TrimSpace(asString(message["role"]))) {
+		case "assistant":
+			filteredBlocks := make([]any, 0, len(contentBlocks))
+			removedSearchToolUse := false
+			for _, rawBlock := range contentBlocks {
+				block := asMap(rawBlock)
+				if strings.EqualFold(asString(block["type"]), "tool_use") {
+					if _, ok := searchToolUseIDs[asString(block["id"])]; ok {
+						removedSearchToolUse = true
+						rewroteAny = true
+						continue
+					}
+				}
+				filteredBlocks = append(filteredBlocks, rawBlock)
+			}
+			if removedSearchToolUse && len(filteredBlocks) == 0 {
+				continue
+			}
+			message["content"] = filteredBlocks
+			rewrittenMessages = append(rewrittenMessages, message)
+		case "user":
+			filteredBlocks := make([]any, 0, len(contentBlocks))
+			for _, rawBlock := range contentBlocks {
+				block := asMap(rawBlock)
+				if strings.EqualFold(asString(block["type"]), "tool_result") {
+					if _, ok := searchToolUseIDs[asString(block["tool_use_id"])]; ok {
+						rendered := renderAnthropicToolResultAsText(block["content"])
+						if rendered != "" {
+							filteredBlocks = append(filteredBlocks, map[string]any{
+								"type": "text",
+								"text": rendered,
+							})
+						}
+						rewroteAny = true
+						continue
+					}
+				}
+				filteredBlocks = append(filteredBlocks, rawBlock)
+			}
+			message["content"] = filteredBlocks
+			rewrittenMessages = append(rewrittenMessages, message)
+		default:
+			rewrittenMessages = append(rewrittenMessages, rawMessage)
+		}
+	}
+
+	if !rewroteAny {
+		return false
+	}
+	body["messages"] = rewrittenMessages
+	return true
+}
+
+func collectAnthropicSearchToolUseIDs(messages []any) map[string]string {
+	toolUseIDs := make(map[string]string)
+	for _, rawMessage := range messages {
+		message := asMap(rawMessage)
+		if !strings.EqualFold(asString(message["role"]), "assistant") {
+			continue
+		}
+		for _, rawBlock := range asSlice(message["content"]) {
+			block := asMap(rawBlock)
+			if !strings.EqualFold(asString(block["type"]), "tool_use") {
+				continue
+			}
+			name := strings.TrimSpace(asString(block["name"]))
+			id := strings.TrimSpace(asString(block["id"]))
+			if id == "" || !isSearchToolName(name) {
+				continue
+			}
+			toolUseIDs[id] = name
+		}
+	}
+	return toolUseIDs
+}
+
+func renderAnthropicToolResultAsText(content any) string {
+	rendered := strings.TrimSpace(renderToolResultContent(content))
+	if rendered == "" {
+		return ""
+	}
+	return pluginConfig.InjectLabel + "\n" + rendered
 }
 
 func injectSearchResults(path string, body map[string]any, query string, results []searchResult) bool {
@@ -569,6 +720,212 @@ func renderSearchResults(query string, results []searchResult) string {
 	}
 	lines = append(lines, "Use these live search results when answering current or time-sensitive questions.")
 	return strings.Join(lines, "\n")
+}
+
+func renderToolResultContent(content any) string {
+	switch value := content.(type) {
+	case string:
+		return strings.TrimSpace(value)
+	case []any:
+		parts := make([]string, 0, len(value))
+		for _, rawPart := range value {
+			part := asMap(rawPart)
+			if len(part) == 0 {
+				continue
+			}
+			switch strings.ToLower(strings.TrimSpace(asString(part["type"]))) {
+			case "text", "input_text":
+				text := strings.TrimSpace(firstNonEmpty(asString(part["text"]), asString(part["input_text"])))
+				if text != "" {
+					parts = append(parts, text)
+				}
+			case "json":
+				if payload, ok := part["json"]; ok {
+					if marshaled, err := json.Marshal(payload); err == nil {
+						parts = append(parts, string(marshaled))
+					}
+				}
+			default:
+				if text := strings.TrimSpace(asString(part["text"])); text != "" {
+					parts = append(parts, text)
+				}
+			}
+		}
+		return strings.TrimSpace(strings.Join(parts, "\n\n"))
+	default:
+		if marshaled, err := json.Marshal(value); err == nil {
+			return strings.TrimSpace(string(marshaled))
+		}
+		return ""
+	}
+}
+
+func anthropicToolUseResponse(req *schemas.HTTPRequest, model, toolName, query string) (*schemas.HTTPResponse, error) {
+	messageID := "msg_" + compactUUID(22)
+	toolUseID := "toolu_" + compactUUID(24)
+	payload := map[string]any{
+		"id":    messageID,
+		"type":  "message",
+		"role":  "assistant",
+		"model": model,
+		"content": []any{
+			map[string]any{
+				"type":  "tool_use",
+				"id":    toolUseID,
+				"name":  toolName,
+				"input": map[string]any{"query": query},
+			},
+		},
+		"stop_reason":   "tool_use",
+		"stop_sequence": nil,
+		"usage": map[string]any{
+			"input_tokens":  0,
+			"output_tokens": 0,
+		},
+	}
+
+	headers := map[string]string{
+		"cache-control": "no-cache",
+	}
+	if anthropicVersion := req.CaseInsensitiveHeaderLookup("anthropic-version"); anthropicVersion != "" {
+		headers["anthropic-version"] = anthropicVersion
+	}
+
+	if asBool(payloadValue(req, "stream")) {
+		body, err := anthropicToolUseStreamBody(payload)
+		if err != nil {
+			return nil, err
+		}
+		headers["content-type"] = "text/event-stream"
+		headers["connection"] = "keep-alive"
+		return &schemas.HTTPResponse{
+			StatusCode: http.StatusOK,
+			Headers:    headers,
+			Body:       body,
+		}, nil
+	}
+
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return nil, err
+	}
+	headers["content-type"] = "application/json"
+	return &schemas.HTTPResponse{
+		StatusCode: http.StatusOK,
+		Headers:    headers,
+		Body:       body,
+	}, nil
+}
+
+func payloadValue(req *schemas.HTTPRequest, key string) any {
+	if req == nil || len(req.Body) == 0 {
+		return nil
+	}
+	var body map[string]any
+	if err := json.Unmarshal(req.Body, &body); err != nil {
+		return nil
+	}
+	return body[key]
+}
+
+func asBool(value any) bool {
+	switch typed := value.(type) {
+	case bool:
+		return typed
+	case string:
+		return strings.EqualFold(strings.TrimSpace(typed), "true")
+	default:
+		return false
+	}
+}
+
+func anthropicToolUseStreamBody(payload map[string]any) ([]byte, error) {
+	var buffer bytes.Buffer
+	messageID := asString(payload["id"])
+	model := asString(payload["model"])
+	contentBlocks := asSlice(payload["content"])
+	toolBlock := map[string]any{}
+	if len(contentBlocks) > 0 {
+		toolBlock = asMap(contentBlocks[0])
+	}
+
+	if err := emitAnthropicSSE(&buffer, "message_start", map[string]any{
+		"type": "message_start",
+		"message": map[string]any{
+			"id":            messageID,
+			"type":          "message",
+			"role":          "assistant",
+			"model":         model,
+			"content":       []any{},
+			"stop_reason":   nil,
+			"stop_sequence": nil,
+			"usage": map[string]any{
+				"input_tokens":  0,
+				"output_tokens": 0,
+			},
+		},
+	}); err != nil {
+		return nil, err
+	}
+	if err := emitAnthropicSSE(&buffer, "content_block_start", map[string]any{
+		"type":  "content_block_start",
+		"index": 0,
+		"content_block": map[string]any{
+			"type":  "tool_use",
+			"id":    asString(toolBlock["id"]),
+			"name":  asString(toolBlock["name"]),
+			"input": map[string]any{},
+		},
+	}); err != nil {
+		return nil, err
+	}
+	inputJSON, err := json.Marshal(asMap(toolBlock["input"]))
+	if err != nil {
+		return nil, err
+	}
+	if err := emitAnthropicSSE(&buffer, "content_block_delta", map[string]any{
+		"type":  "content_block_delta",
+		"index": 0,
+		"delta": map[string]any{
+			"type":         "input_json_delta",
+			"partial_json": string(inputJSON),
+		},
+	}); err != nil {
+		return nil, err
+	}
+	if err := emitAnthropicSSE(&buffer, "content_block_stop", map[string]any{
+		"type":  "content_block_stop",
+		"index": 0,
+	}); err != nil {
+		return nil, err
+	}
+	if err := emitAnthropicSSE(&buffer, "message_delta", map[string]any{
+		"type": "message_delta",
+		"delta": map[string]any{
+			"stop_reason": "tool_use",
+		},
+		"usage": map[string]any{
+			"input_tokens":  0,
+			"output_tokens": 0,
+		},
+	}); err != nil {
+		return nil, err
+	}
+	if err := emitAnthropicSSE(&buffer, "message_stop", map[string]any{
+		"type": "message_stop",
+	}); err != nil {
+		return nil, err
+	}
+	return buffer.Bytes(), nil
+}
+
+func emitAnthropicSSE(writer io.Writer, eventName string, payload any) error {
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+	_, err = fmt.Fprintf(writer, "event: %s\ndata: %s\n\n", eventName, data)
+	return err
 }
 
 func doSearch(query string, maxResults int) ([]searchResult, error) {
@@ -908,6 +1265,14 @@ func firstNonEmpty(values ...string) string {
 		}
 	}
 	return ""
+}
+
+func compactUUID(length int) string {
+	value := strings.ReplaceAll(uuid.NewString(), "-", "")
+	if length <= 0 || length >= len(value) {
+		return value
+	}
+	return value[:length]
 }
 
 func trimForLog(text string) string {
