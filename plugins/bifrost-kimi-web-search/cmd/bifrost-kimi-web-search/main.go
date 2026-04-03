@@ -1,0 +1,957 @@
+package main
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"log"
+	"net/http"
+	"net/url"
+	"reflect"
+	"strings"
+	"time"
+	"unsafe"
+
+	"github.com/google/uuid"
+	"github.com/maximhq/bifrost/core/schemas"
+	"golang.org/x/net/html"
+)
+
+type PluginConfig struct {
+	Enabled          bool     `json:"enabled"`
+	Debug            bool     `json:"debug"`
+	Paths            []string `json:"paths"`
+	MatchModels      []string `json:"match_models"`
+	MatchSubstrings  []string `json:"match_substrings"`
+	MatchVirtualKeys []string `json:"match_virtual_keys"`
+	SearchToolNames  []string `json:"search_tool_names"`
+	MaxResults       int      `json:"max_results"`
+	TimeoutMS        int      `json:"timeout_ms"`
+	InjectLabel      string   `json:"inject_label"`
+
+	normalizedPaths map[string]struct{} `json:"-"`
+}
+
+type searchResult struct {
+	Title   string `json:"title"`
+	URL     string `json:"url"`
+	Snippet string `json:"snippet,omitempty"`
+}
+
+type ddgInstantAnswer struct {
+	Heading       string         `json:"Heading"`
+	AbstractURL   string         `json:"AbstractURL"`
+	AbstractText  string         `json:"AbstractText"`
+	RelatedTopics []instantTopic `json:"RelatedTopics"`
+}
+
+type instantTopic struct {
+	FirstURL string         `json:"FirstURL"`
+	Text     string         `json:"Text"`
+	Topics   []instantTopic `json:"Topics"`
+}
+
+var pluginConfig = PluginConfig{
+	Enabled:         true,
+	Paths:           []string{"/anthropic/v1/messages", "/v1/chat/completions"},
+	MatchModels:     []string{"Kimi-K2.5", "claude-sonnet-4-6"},
+	MatchSubstrings: []string{"__azure-kimi"},
+	SearchToolNames: []string{"web_search", "search_web"},
+	MaxResults:      5,
+	TimeoutMS:       20000,
+	InjectLabel:     "[Server Web Search Results]",
+	normalizedPaths: nil,
+}
+
+var searchHTTPClient = &http.Client{Timeout: 20 * time.Second}
+
+func Init(config any) error {
+	if config != nil {
+		raw, err := json.Marshal(config)
+		if err != nil {
+			return fmt.Errorf("marshal config: %w", err)
+		}
+		var parsed PluginConfig
+		if err := json.Unmarshal(raw, &parsed); err != nil {
+			return fmt.Errorf("unmarshal config: %w", err)
+		}
+		mergeConfig(&pluginConfig, parsed)
+	}
+	if len(pluginConfig.Paths) == 0 {
+		pluginConfig.Paths = []string{"/anthropic/v1/messages", "/v1/chat/completions"}
+	}
+	if len(pluginConfig.SearchToolNames) == 0 {
+		pluginConfig.SearchToolNames = []string{"web_search", "search_web"}
+	}
+	if pluginConfig.MaxResults <= 0 {
+		pluginConfig.MaxResults = 5
+	}
+	if pluginConfig.TimeoutMS <= 0 {
+		pluginConfig.TimeoutMS = 20000
+	}
+	if pluginConfig.InjectLabel == "" {
+		pluginConfig.InjectLabel = "[Server Web Search Results]"
+	}
+	pluginConfig.normalizedPaths = make(map[string]struct{}, len(pluginConfig.Paths))
+	for _, path := range pluginConfig.Paths {
+		pluginConfig.normalizedPaths[normalizePath(path)] = struct{}{}
+	}
+	searchHTTPClient = &http.Client{Timeout: time.Duration(pluginConfig.TimeoutMS) * time.Millisecond}
+	log.Printf("[%s] initialized paths=%v match_models=%v match_substrings=%v match_virtual_keys=%v search_tool_names=%v max_results=%d timeout_ms=%d",
+		GetName(),
+		pluginConfig.Paths,
+		pluginConfig.MatchModels,
+		pluginConfig.MatchSubstrings,
+		maskSensitiveList(pluginConfig.MatchVirtualKeys),
+		pluginConfig.SearchToolNames,
+		pluginConfig.MaxResults,
+		pluginConfig.TimeoutMS,
+	)
+	return nil
+}
+
+func GetName() string {
+	return "bifrost-kimi-web-search"
+}
+
+func Cleanup() error {
+	return nil
+}
+
+func HTTPTransportPreHook(ctx *schemas.BifrostContext, req *schemas.HTTPRequest) (*schemas.HTTPResponse, error) {
+	if !pluginConfig.Enabled || req == nil || !strings.EqualFold(req.Method, http.MethodPost) {
+		return nil, nil
+	}
+	if !pathEnabled(req.Path) || len(req.Body) == 0 {
+		return nil, nil
+	}
+
+	var body map[string]any
+	if err := json.Unmarshal(req.Body, &body); err != nil {
+		return nil, nil
+	}
+	model := asString(body["model"])
+	if !shouldHandleRequest(ctx, req, model) {
+		return nil, nil
+	}
+
+	toolNames := extractSearchToolNames(req.Path, body)
+	if len(toolNames) == 0 {
+		debugf("skipping search augmentation for model=%q path=%s: no matching search tools", model, req.Path)
+		return nil, nil
+	}
+	if hasToolResults(req.Path, body) {
+		debugf("skipping search augmentation for model=%q path=%s: tool results already present", model, req.Path)
+		return nil, nil
+	}
+
+	query := latestUserText(req.Path, body)
+	if query == "" {
+		debugf("skipping search augmentation for model=%q path=%s: empty user query", model, req.Path)
+		return nil, nil
+	}
+
+	results, err := doSearch(query, pluginConfig.MaxResults)
+	if err != nil {
+		debugf("search failed model=%q path=%s query=%q error=%v", model, req.Path, query, err)
+		return nil, nil
+	}
+
+	if !injectSearchResults(req.Path, body, query, results) {
+		debugf("skipping search augmentation for model=%q path=%s: could not inject result payload", model, req.Path)
+		return nil, nil
+	}
+	removeSearchTools(req.Path, body)
+
+	encoded, err := json.Marshal(body)
+	if err != nil {
+		return nil, err
+	}
+	req.Body = encoded
+	debugf("injected server search model=%q path=%s query=%q results=%d", model, req.Path, trimForLog(query), len(results))
+	return nil, nil
+}
+
+func HTTPTransportPostHook(ctx *schemas.BifrostContext, req *schemas.HTTPRequest, resp *schemas.HTTPResponse) error {
+	return nil
+}
+
+func HTTPTransportStreamChunkHook(ctx *schemas.BifrostContext, req *schemas.HTTPRequest, chunk *schemas.BifrostStreamChunk) (*schemas.BifrostStreamChunk, error) {
+	return chunk, nil
+}
+
+func mergeConfig(dst *PluginConfig, src PluginConfig) {
+	dst.Enabled = src.Enabled
+	dst.Debug = src.Debug
+	if len(src.Paths) > 0 {
+		dst.Paths = append([]string(nil), src.Paths...)
+	}
+	if len(src.MatchModels) > 0 {
+		dst.MatchModels = append([]string(nil), src.MatchModels...)
+	}
+	if len(src.MatchSubstrings) > 0 {
+		dst.MatchSubstrings = append([]string(nil), src.MatchSubstrings...)
+	}
+	if len(src.MatchVirtualKeys) > 0 {
+		dst.MatchVirtualKeys = append([]string(nil), src.MatchVirtualKeys...)
+	}
+	if len(src.SearchToolNames) > 0 {
+		dst.SearchToolNames = append([]string(nil), src.SearchToolNames...)
+	}
+	if src.MaxResults > 0 {
+		dst.MaxResults = src.MaxResults
+	}
+	if src.TimeoutMS > 0 {
+		dst.TimeoutMS = src.TimeoutMS
+	}
+	if src.InjectLabel != "" {
+		dst.InjectLabel = src.InjectLabel
+	}
+}
+
+func pathEnabled(path string) bool {
+	if len(pluginConfig.normalizedPaths) == 0 {
+		return true
+	}
+	_, ok := pluginConfig.normalizedPaths[normalizePath(path)]
+	return ok
+}
+
+func shouldHandleRequest(ctx *schemas.BifrostContext, req *schemas.HTTPRequest, model string) bool {
+	return shouldHandleModel(model) && shouldHandleVirtualKey(ctx, req)
+}
+
+func shouldHandleModel(model string) bool {
+	variants := modelMatchVariants(model)
+	if len(variants) == 0 {
+		return false
+	}
+	for _, candidate := range pluginConfig.MatchModels {
+		candidate = strings.TrimSpace(candidate)
+		for _, variant := range variants {
+			if strings.EqualFold(candidate, variant) {
+				return true
+			}
+		}
+	}
+	for _, candidate := range pluginConfig.MatchSubstrings {
+		candidate = strings.ToLower(strings.TrimSpace(candidate))
+		if candidate == "" {
+			continue
+		}
+		for _, variant := range variants {
+			if strings.Contains(strings.ToLower(variant), candidate) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func shouldHandleVirtualKey(ctx *schemas.BifrostContext, req *schemas.HTTPRequest) bool {
+	if len(pluginConfig.MatchVirtualKeys) == 0 {
+		return true
+	}
+	virtualKey := firstNonEmpty(
+		contextStringValue(ctx, schemas.BifrostContextKeyVirtualKey),
+		headerVirtualKey(req),
+	)
+	if virtualKey == "" {
+		return false
+	}
+	for _, candidate := range pluginConfig.MatchVirtualKeys {
+		if strings.EqualFold(strings.TrimSpace(candidate), virtualKey) {
+			return true
+		}
+	}
+	return false
+}
+
+func extractSearchToolNames(path string, body map[string]any) []string {
+	names := make([]string, 0)
+	seen := make(map[string]struct{})
+	switch normalizePath(path) {
+	case "/anthropic/v1/messages":
+		for _, rawTool := range asSlice(body["tools"]) {
+			tool := asMap(rawTool)
+			name := normalizeToolName(asString(tool["name"]))
+			if name == "" || !isSearchToolName(name) {
+				continue
+			}
+			if _, ok := seen[name]; ok {
+				continue
+			}
+			seen[name] = struct{}{}
+			names = append(names, name)
+		}
+	case "/v1/chat/completions":
+		for _, rawTool := range asSlice(body["tools"]) {
+			tool := asMap(rawTool)
+			function := asMap(tool["function"])
+			name := normalizeToolName(asString(function["name"]))
+			if name == "" || !isSearchToolName(name) {
+				continue
+			}
+			if _, ok := seen[name]; ok {
+				continue
+			}
+			seen[name] = struct{}{}
+			names = append(names, name)
+		}
+	}
+	return names
+}
+
+func isSearchToolName(name string) bool {
+	name = normalizeToolName(name)
+	if name == "" {
+		return false
+	}
+	for _, candidate := range pluginConfig.SearchToolNames {
+		if normalizeToolName(candidate) == name {
+			return true
+		}
+	}
+	return false
+}
+
+func normalizeToolName(name string) string {
+	return strings.ToLower(strings.TrimSpace(name))
+}
+
+func hasToolResults(path string, body map[string]any) bool {
+	switch normalizePath(path) {
+	case "/anthropic/v1/messages":
+		for _, rawMessage := range asSlice(body["messages"]) {
+			message := asMap(rawMessage)
+			for _, rawBlock := range asSlice(message["content"]) {
+				block := asMap(rawBlock)
+				if strings.EqualFold(asString(block["type"]), "tool_result") {
+					return true
+				}
+			}
+		}
+	case "/v1/chat/completions":
+		for _, rawMessage := range asSlice(body["messages"]) {
+			message := asMap(rawMessage)
+			if strings.EqualFold(asString(message["role"]), "tool") {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func latestUserText(path string, body map[string]any) string {
+	switch normalizePath(path) {
+	case "/anthropic/v1/messages":
+		for i := len(asSlice(body["messages"])) - 1; i >= 0; i-- {
+			message := asMap(asSlice(body["messages"])[i])
+			if !strings.EqualFold(asString(message["role"]), "user") {
+				continue
+			}
+			return extractAnthropicMessageText(message["content"])
+		}
+	case "/v1/chat/completions":
+		for i := len(asSlice(body["messages"])) - 1; i >= 0; i-- {
+			message := asMap(asSlice(body["messages"])[i])
+			if !strings.EqualFold(asString(message["role"]), "user") {
+				continue
+			}
+			return extractOpenAIMessageText(message["content"])
+		}
+	}
+	return ""
+}
+
+func extractAnthropicMessageText(content any) string {
+	switch value := content.(type) {
+	case string:
+		return strings.TrimSpace(value)
+	case []any:
+		parts := make([]string, 0)
+		for _, rawPart := range value {
+			part := asMap(rawPart)
+			if strings.EqualFold(asString(part["type"]), "text") {
+				text := strings.TrimSpace(asString(part["text"]))
+				if text != "" {
+					parts = append(parts, text)
+				}
+			}
+		}
+		return strings.TrimSpace(strings.Join(parts, "\n\n"))
+	default:
+		return ""
+	}
+}
+
+func extractOpenAIMessageText(content any) string {
+	switch value := content.(type) {
+	case string:
+		return strings.TrimSpace(value)
+	case []any:
+		parts := make([]string, 0)
+		for _, rawPart := range value {
+			part := asMap(rawPart)
+			partType := strings.ToLower(strings.TrimSpace(asString(part["type"])))
+			switch partType {
+			case "text", "input_text":
+				text := strings.TrimSpace(firstNonEmpty(asString(part["text"]), asString(part["input_text"])))
+				if text != "" {
+					parts = append(parts, text)
+				}
+			}
+		}
+		return strings.TrimSpace(strings.Join(parts, "\n\n"))
+	default:
+		return ""
+	}
+}
+
+func injectSearchResults(path string, body map[string]any, query string, results []searchResult) bool {
+	searchText := renderSearchResults(query, results)
+	switch normalizePath(path) {
+	case "/anthropic/v1/messages":
+		messages := asSlice(body["messages"])
+		for i := len(messages) - 1; i >= 0; i-- {
+			message := asMap(messages[i])
+			if !strings.EqualFold(asString(message["role"]), "user") {
+				continue
+			}
+			message["content"] = injectAnthropicContent(message["content"], searchText)
+			return true
+		}
+	case "/v1/chat/completions":
+		messages := asSlice(body["messages"])
+		for i := len(messages) - 1; i >= 0; i-- {
+			message := asMap(messages[i])
+			if !strings.EqualFold(asString(message["role"]), "user") {
+				continue
+			}
+			message["content"] = injectOpenAIContent(message["content"], searchText)
+			return true
+		}
+	}
+	return false
+}
+
+func injectAnthropicContent(content any, searchText string) any {
+	switch value := content.(type) {
+	case string:
+		if strings.TrimSpace(value) == "" {
+			return searchText
+		}
+		return value + "\n\n" + searchText
+	case []any:
+		cloned := append([]any(nil), value...)
+		for i, rawPart := range cloned {
+			part := asMap(rawPart)
+			if strings.EqualFold(asString(part["type"]), "text") {
+				part["text"] = strings.TrimSpace(asString(part["text"]) + "\n\n" + searchText)
+				cloned[i] = part
+				return cloned
+			}
+		}
+		return append(cloned, map[string]any{"type": "text", "text": searchText})
+	default:
+		return []any{map[string]any{"type": "text", "text": searchText}}
+	}
+}
+
+func injectOpenAIContent(content any, searchText string) any {
+	switch value := content.(type) {
+	case string:
+		if strings.TrimSpace(value) == "" {
+			return searchText
+		}
+		return value + "\n\n" + searchText
+	case []any:
+		cloned := append([]any(nil), value...)
+		for i, rawPart := range cloned {
+			part := asMap(rawPart)
+			partType := strings.ToLower(strings.TrimSpace(asString(part["type"])))
+			if partType == "text" || partType == "input_text" {
+				current := firstNonEmpty(asString(part["text"]), asString(part["input_text"]))
+				if partType == "input_text" {
+					part["input_text"] = strings.TrimSpace(current + "\n\n" + searchText)
+				} else {
+					part["text"] = strings.TrimSpace(current + "\n\n" + searchText)
+				}
+				cloned[i] = part
+				return cloned
+			}
+		}
+		return append(cloned, map[string]any{"type": "text", "text": searchText})
+	default:
+		return []any{map[string]any{"type": "text", "text": searchText}}
+	}
+}
+
+func removeSearchTools(path string, body map[string]any) {
+	switch normalizePath(path) {
+	case "/anthropic/v1/messages":
+		filtered := make([]any, 0)
+		for _, rawTool := range asSlice(body["tools"]) {
+			tool := asMap(rawTool)
+			if isSearchToolName(asString(tool["name"])) {
+				continue
+			}
+			filtered = append(filtered, rawTool)
+		}
+		updateToolsAndChoice(body, filtered, anthropicToolChoiceShouldClear(body["tool_choice"]))
+	case "/v1/chat/completions":
+		filtered := make([]any, 0)
+		for _, rawTool := range asSlice(body["tools"]) {
+			tool := asMap(rawTool)
+			function := asMap(tool["function"])
+			if isSearchToolName(asString(function["name"])) {
+				continue
+			}
+			filtered = append(filtered, rawTool)
+		}
+		updateToolsAndChoice(body, filtered, openAIToolChoiceShouldClear(body["tool_choice"]))
+	}
+}
+
+func updateToolsAndChoice(body map[string]any, filtered []any, clearChoice bool) {
+	if len(filtered) == 0 {
+		delete(body, "tools")
+	} else {
+		body["tools"] = filtered
+	}
+	if clearChoice || len(filtered) == 0 {
+		delete(body, "tool_choice")
+	}
+}
+
+func anthropicToolChoiceShouldClear(toolChoice any) bool {
+	switch value := toolChoice.(type) {
+	case map[string]any:
+		if strings.EqualFold(asString(value["type"]), "tool") && isSearchToolName(asString(value["name"])) {
+			return true
+		}
+	case string:
+		return isSearchToolName(value)
+	}
+	return false
+}
+
+func openAIToolChoiceShouldClear(toolChoice any) bool {
+	switch value := toolChoice.(type) {
+	case map[string]any:
+		if strings.EqualFold(asString(value["type"]), "function") {
+			function := asMap(value["function"])
+			return isSearchToolName(asString(function["name"]))
+		}
+	case string:
+		return isSearchToolName(value)
+	}
+	return false
+}
+
+func renderSearchResults(query string, results []searchResult) string {
+	lines := []string{
+		pluginConfig.InjectLabel,
+		"Query: " + query,
+	}
+	if len(results) == 0 {
+		lines = append(lines, "No search results were found.")
+		return strings.Join(lines, "\n")
+	}
+	for index, item := range results {
+		lines = append(lines, fmt.Sprintf("%d. %s", index+1, item.Title))
+		lines = append(lines, "   URL: "+item.URL)
+		if item.Snippet != "" {
+			lines = append(lines, "   Snippet: "+item.Snippet)
+		}
+	}
+	lines = append(lines, "Use these live search results when answering current or time-sensitive questions.")
+	return strings.Join(lines, "\n")
+}
+
+func doSearch(query string, maxResults int) ([]searchResult, error) {
+	query = strings.TrimSpace(query)
+	if query == "" {
+		return nil, fmt.Errorf("query is required")
+	}
+	if maxResults <= 0 {
+		maxResults = 5
+	}
+	if maxResults > 10 {
+		maxResults = 10
+	}
+	results, err := duckDuckGoHTMLSearch(query, maxResults)
+	if err == nil && len(results) > 0 {
+		return results, nil
+	}
+	fallback, fallbackErr := duckDuckGoInstantAnswer(query, maxResults)
+	if fallbackErr != nil {
+		if err != nil {
+			return nil, err
+		}
+		return nil, fallbackErr
+	}
+	return fallback, nil
+}
+
+func duckDuckGoHTMLSearch(query string, maxResults int) ([]searchResult, error) {
+	form := url.Values{}
+	form.Set("q", query)
+	form.Set("kl", "us-en")
+	req, err := http.NewRequest(http.MethodPost, "https://html.duckduckgo.com/html/", strings.NewReader(form.Encode()))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("content-type", "application/x-www-form-urlencoded")
+	req.Header.Set("user-agent", "Mozilla/5.0 bifrost-kimi-web-search/1.0")
+	resp, err := searchHTTPClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		return nil, fmt.Errorf("search endpoint returned status %d", resp.StatusCode)
+	}
+	doc, err := html.Parse(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+	results := extractDDGResults(doc, maxResults)
+	if len(results) == 0 {
+		return nil, fmt.Errorf("no html search results")
+	}
+	return results, nil
+}
+
+func extractDDGResults(root *html.Node, maxResults int) []searchResult {
+	results := make([]searchResult, 0, maxResults)
+	var walk func(*html.Node)
+	walk = func(node *html.Node) {
+		if node == nil || len(results) >= maxResults {
+			return
+		}
+		if node.Type == html.ElementNode && node.Data == "div" && hasClass(node, "result") {
+			titleNode := findFirstNode(node, func(candidate *html.Node) bool {
+				return candidate.Type == html.ElementNode && candidate.Data == "a" && hasClass(candidate, "result__a")
+			})
+			if titleNode != nil {
+				title := cleanText(nodeText(titleNode))
+				targetURL := decodeResultURL(attrValue(titleNode, "href"))
+				snippetNode := findFirstNode(node, func(candidate *html.Node) bool {
+					return candidate.Type == html.ElementNode && hasClass(candidate, "result__snippet")
+				})
+				snippet := ""
+				if snippetNode != nil {
+					snippet = cleanText(nodeText(snippetNode))
+				}
+				if title != "" && targetURL != "" {
+					results = append(results, searchResult{
+						Title:   title,
+						URL:     targetURL,
+						Snippet: snippet,
+					})
+				}
+			}
+		}
+		for child := node.FirstChild; child != nil && len(results) < maxResults; child = child.NextSibling {
+			walk(child)
+		}
+	}
+	walk(root)
+	return results
+}
+
+func duckDuckGoInstantAnswer(query string, maxResults int) ([]searchResult, error) {
+	u, err := url.Parse("https://api.duckduckgo.com/")
+	if err != nil {
+		return nil, err
+	}
+	params := url.Values{}
+	params.Set("q", query)
+	params.Set("format", "json")
+	params.Set("no_html", "1")
+	params.Set("skip_disambig", "1")
+	u.RawQuery = params.Encode()
+	req, err := http.NewRequest(http.MethodGet, u.String(), nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("user-agent", "Mozilla/5.0 bifrost-kimi-web-search/1.0")
+	resp, err := searchHTTPClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		return nil, fmt.Errorf("instant answer endpoint returned status %d", resp.StatusCode)
+	}
+	var payload ddgInstantAnswer
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		return nil, err
+	}
+	results := make([]searchResult, 0, maxResults)
+	if payload.AbstractURL != "" && (payload.Heading != "" || payload.AbstractText != "") {
+		results = append(results, searchResult{
+			Title:   cleanText(firstNonEmpty(payload.Heading, payload.AbstractURL)),
+			URL:     payload.AbstractURL,
+			Snippet: cleanText(payload.AbstractText),
+		})
+	}
+	flattened := flattenInstantTopics(payload.RelatedTopics)
+	for _, item := range flattened {
+		if len(results) >= maxResults {
+			break
+		}
+		if item.FirstURL == "" {
+			continue
+		}
+		results = append(results, searchResult{
+			Title:   cleanText(firstNonEmpty(item.Text, item.FirstURL)),
+			URL:     item.FirstURL,
+			Snippet: cleanText(item.Text),
+		})
+	}
+	if len(results) == 0 {
+		return nil, fmt.Errorf("no instant answer results")
+	}
+	return results, nil
+}
+
+func flattenInstantTopics(items []instantTopic) []instantTopic {
+	flattened := make([]instantTopic, 0)
+	var walk func([]instantTopic)
+	walk = func(nodes []instantTopic) {
+		for _, item := range nodes {
+			if item.FirstURL != "" || item.Text != "" {
+				flattened = append(flattened, item)
+			}
+			if len(item.Topics) > 0 {
+				walk(item.Topics)
+			}
+		}
+	}
+	walk(items)
+	return flattened
+}
+
+func decodeResultURL(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
+	}
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		return raw
+	}
+	if strings.HasSuffix(strings.ToLower(parsed.Hostname()), "duckduckgo.com") && strings.HasPrefix(parsed.Path, "/l/") {
+		if target := parsed.Query().Get("uddg"); target != "" {
+			decoded, err := url.QueryUnescape(target)
+			if err == nil && decoded != "" {
+				return decoded
+			}
+			return target
+		}
+	}
+	return raw
+}
+
+func findFirstNode(node *html.Node, predicate func(*html.Node) bool) *html.Node {
+	if node == nil {
+		return nil
+	}
+	if predicate(node) {
+		return node
+	}
+	for child := node.FirstChild; child != nil; child = child.NextSibling {
+		if found := findFirstNode(child, predicate); found != nil {
+			return found
+		}
+	}
+	return nil
+}
+
+func hasClass(node *html.Node, class string) bool {
+	values := strings.Fields(attrValue(node, "class"))
+	for _, value := range values {
+		if value == class {
+			return true
+		}
+	}
+	return false
+}
+
+func attrValue(node *html.Node, key string) string {
+	if node == nil {
+		return ""
+	}
+	for _, attr := range node.Attr {
+		if strings.EqualFold(attr.Key, key) {
+			return attr.Val
+		}
+	}
+	return ""
+}
+
+func nodeText(node *html.Node) string {
+	if node == nil {
+		return ""
+	}
+	var builder strings.Builder
+	var walk func(*html.Node)
+	walk = func(current *html.Node) {
+		if current == nil {
+			return
+		}
+		if current.Type == html.TextNode {
+			builder.WriteString(current.Data)
+			builder.WriteByte(' ')
+		}
+		for child := current.FirstChild; child != nil; child = child.NextSibling {
+			walk(child)
+		}
+	}
+	walk(node)
+	return builder.String()
+}
+
+func cleanText(text string) string {
+	return strings.Join(strings.Fields(strings.TrimSpace(text)), " ")
+}
+
+func normalizePath(path string) string {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return "/"
+	}
+	if !strings.HasPrefix(path, "/") {
+		path = "/" + path
+	}
+	return path
+}
+
+func modelMatchVariants(model string) []string {
+	model = strings.TrimSpace(model)
+	if model == "" {
+		return nil
+	}
+	variants := []string{model}
+	if slash := strings.Index(model, "/"); slash > 0 && slash < len(model)-1 {
+		trimmed := strings.TrimSpace(model[slash+1:])
+		if trimmed != "" && !strings.EqualFold(trimmed, model) {
+			variants = append(variants, trimmed)
+		}
+	}
+	return variants
+}
+
+func contextStringValue(ctx *schemas.BifrostContext, key any) string {
+	if ctx == nil {
+		return ""
+	}
+	return strings.TrimSpace(asString(ctx.Value(key)))
+}
+
+func headerVirtualKey(req *schemas.HTTPRequest) string {
+	if req == nil {
+		return ""
+	}
+	if vk := strings.TrimSpace(req.CaseInsensitiveHeaderLookup("x-bf-vk")); vk != "" {
+		return vk
+	}
+	if apiKey := strings.TrimSpace(req.CaseInsensitiveHeaderLookup("x-api-key")); apiKey != "" {
+		return apiKey
+	}
+	authorization := strings.TrimSpace(req.CaseInsensitiveHeaderLookup("authorization"))
+	if strings.HasPrefix(strings.ToLower(authorization), "bearer ") {
+		return strings.TrimSpace(authorization[7:])
+	}
+	return ""
+}
+
+func asMap(value any) map[string]any {
+	if value == nil {
+		return nil
+	}
+	if typed, ok := value.(map[string]any); ok {
+		return typed
+	}
+	return nil
+}
+
+func asSlice(value any) []any {
+	if value == nil {
+		return nil
+	}
+	if typed, ok := value.([]any); ok {
+		return typed
+	}
+	return nil
+}
+
+func asString(value any) string {
+	switch typed := value.(type) {
+	case string:
+		return typed
+	case fmt.Stringer:
+		return typed.String()
+	default:
+		return ""
+	}
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func trimForLog(text string) string {
+	text = cleanText(text)
+	if len(text) <= 160 {
+		return text
+	}
+	return text[:160] + "..."
+}
+
+func maskSensitiveList(values []string) []string {
+	if len(values) == 0 {
+		return nil
+	}
+	masked := make([]string, 0, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
+		if len(value) <= 10 {
+			masked = append(masked, "****")
+			continue
+		}
+		masked = append(masked, value[:6]+"..."+value[len(value)-4:])
+	}
+	return masked
+}
+
+func debugf(format string, args ...any) {
+	if !pluginConfig.Debug {
+		return
+	}
+	log.Printf("[%s] %s", GetName(), fmt.Sprintf(format, args...))
+}
+
+// Keep the linked package graph close to the other plugins. This avoids fragile
+// Go plugin loader differences between tiny and large plugin binaries.
+var (
+	_ = bytes.NewBuffer
+	_ = context.Background
+	_ = io.Copy
+	_ = reflect.TypeOf
+	_ = time.Second
+	_ = unsafe.Sizeof(0)
+	_ = uuid.NewString
+)
