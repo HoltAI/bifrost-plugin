@@ -137,11 +137,6 @@ func HTTPTransportPreHook(ctx *schemas.BifrostContext, req *schemas.HTTPRequest)
 		return nil, nil
 	}
 
-	toolNames := extractSearchToolNames(req.Path, body)
-	if len(toolNames) == 0 {
-		debugf("skipping search tool protocol for model=%q path=%s: no matching search tools", model, req.Path)
-		return nil, nil
-	}
 	if hasToolResults(req.Path, body) {
 		if normalizePath(req.Path) != "/anthropic/v1/messages" {
 			debugf("skipping search tool result rewrite for model=%q path=%s: unsupported path", model, req.Path)
@@ -158,6 +153,12 @@ func HTTPTransportPreHook(ctx *schemas.BifrostContext, req *schemas.HTTPRequest)
 		}
 		req.Body = encoded
 		debugf("rewrote client search tool_result into user context model=%q path=%s", model, req.Path)
+		return nil, nil
+	}
+
+	toolNames := extractSearchToolNames(req.Path, body)
+	if len(toolNames) == 0 {
+		debugf("skipping search tool protocol for model=%q path=%s: no matching search tools", model, req.Path)
 		return nil, nil
 	}
 
