@@ -523,28 +523,20 @@ func simulateAnthropicStream(ctx *schemas.BifrostContext, req *schemas.HTTPReque
 		return
 	}
 
+	if upstreamResp.StatusCode >= 400 {
+		payload := parseUpstreamErrorPayload(bodyBytes, upstreamResp.StatusCode)
+		if err := emitAnthropicSSE(writer, "error", normalizeAnthropicError(upstreamResp.StatusCode, payload)); err != nil {
+			emitAnthropicStreamError(writer, err.Error())
+		}
+		return
+	}
+
 	var payload map[string]any
 	if len(bodyBytes) > 0 {
 		if err := json.Unmarshal(bodyBytes, &payload); err != nil {
 			emitAnthropicStreamError(writer, fmt.Sprintf("failed to parse internal anthropic response: %v", err))
 			return
 		}
-	}
-
-	if upstreamResp.StatusCode >= 400 {
-		if len(payload) == 0 {
-			payload = map[string]any{
-				"type": "error",
-				"error": map[string]any{
-					"type":    "api_error",
-					"message": fmt.Sprintf("internal anthropic request failed with status %d", upstreamResp.StatusCode),
-				},
-			}
-		}
-		if err := emitAnthropicSSE(writer, "error", normalizeAnthropicError(upstreamResp.StatusCode, payload)); err != nil {
-			emitAnthropicStreamError(writer, err.Error())
-		}
-		return
 	}
 
 	if len(payload) == 0 {
@@ -559,6 +551,34 @@ func simulateAnthropicStream(ctx *schemas.BifrostContext, req *schemas.HTTPReque
 	}
 	if err := streamAnthropicPayload(writer, anthropicPayload); err != nil {
 		emitAnthropicStreamError(writer, err.Error())
+	}
+}
+
+func parseUpstreamErrorPayload(bodyBytes []byte, statusCode int) map[string]any {
+	if len(bodyBytes) > 0 {
+		var payload map[string]any
+		if err := json.Unmarshal(bodyBytes, &payload); err == nil && len(payload) > 0 {
+			return payload
+		}
+
+		text := strings.TrimSpace(string(bodyBytes))
+		if text != "" {
+			return map[string]any{
+				"type": "error",
+				"error": map[string]any{
+					"type":    "api_error",
+					"message": text,
+				},
+			}
+		}
+	}
+
+	return map[string]any{
+		"type": "error",
+		"error": map[string]any{
+			"type":    "api_error",
+			"message": fmt.Sprintf("internal anthropic request failed with status %d", statusCode),
+		},
 	}
 }
 
