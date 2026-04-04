@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/url"
 	"reflect"
+	"sort"
 	"strings"
 	"time"
 	"unsafe"
@@ -584,9 +585,23 @@ func extractAnthropicSearchToolUsesFromContent(content any) []anthropicSearchToo
 		if !isSearchToolName(name) {
 			continue
 		}
+		query := extractSearchToolQuery(block["input"])
+		if query == "" {
+			query = extractSearchToolQuery(block)
+		}
+		if query == "" {
+			debugf(
+				"observed search tool_use without query; name=%q id=%q input_keys=%v block_keys=%v block_summary=%s",
+				name,
+				strings.TrimSpace(asString(block["id"])),
+				sortedMapKeys(asMap(block["input"])),
+				sortedMapKeys(block),
+				trimForLog(renderToolResultContent([]any{block})),
+			)
+		}
 		toolUses = append(toolUses, anthropicSearchToolUse{
 			ID:    strings.TrimSpace(asString(block["id"])),
-			Query: extractSearchToolQuery(block["input"]),
+			Query: query,
 		})
 	}
 	return toolUses
@@ -601,6 +616,13 @@ func extractSearchToolQuery(input any) string {
 		asString(payload["query"]),
 		asString(payload["q"]),
 		asString(payload["search_query"]),
+		asString(payload["text"]),
+		asString(payload["input"]),
+		asString(payload["arguments"]),
+		asString(payload["raw_input"]),
+		asString(asMap(payload["parameters"])["query"]),
+		asString(asMap(payload["arguments"])["query"]),
+		asString(asMap(payload["raw_input"])["query"]),
 	)))
 }
 
@@ -889,6 +911,18 @@ func summarizeAnthropicToolResultState(body map[string]any) string {
 		return "messages-present"
 	}
 	return strings.Join(summaries, " | ")
+}
+
+func sortedMapKeys(value map[string]any) []string {
+	if len(value) == 0 {
+		return nil
+	}
+	keys := make([]string, 0, len(value))
+	for key := range value {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	return keys
 }
 
 func sanitizeAnthropicToolResultText(rendered string) string {
