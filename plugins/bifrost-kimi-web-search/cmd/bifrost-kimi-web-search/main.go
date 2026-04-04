@@ -40,6 +40,10 @@ type searchResult struct {
 	Snippet string `json:"snippet,omitempty"`
 }
 
+type anthropicSearchToolUse struct {
+	Query string
+}
+
 type ddgInstantAnswer struct {
 	Heading       string         `json:"Heading"`
 	AbstractURL   string         `json:"AbstractURL"`
@@ -458,13 +462,16 @@ func rewriteAnthropicSearchToolResults(body map[string]any) bool {
 		return false
 	}
 
-	searchToolUseIDs := collectAnthropicSearchToolUseIDs(messages)
-	if len(searchToolUseIDs) == 0 {
+	searchToolUses := collectAnthropicSearchToolUses(messages)
+	toolResultCount := countAnthropicToolResults(messages)
+	fallbackQuery := extractFallbackSearchQuery(messages)
+	if len(searchToolUses) == 0 && toolResultCount == 0 {
 		return false
 	}
 
 	rewrittenMessages := make([]any, 0, len(messages))
 	rewroteAny := false
+	searchCache := make(map[string]string)
 	for _, rawMessage := range messages {
 		message := asMap(rawMessage)
 		if len(message) == 0 {
@@ -485,7 +492,7 @@ func rewriteAnthropicSearchToolResults(body map[string]any) bool {
 			for _, rawBlock := range contentBlocks {
 				block := asMap(rawBlock)
 				if strings.EqualFold(asString(block["type"]), "tool_use") {
-					if _, ok := searchToolUseIDs[asString(block["id"])]; ok {
+					if _, ok := searchToolUses[asString(block["id"])]; ok {
 						removedSearchToolUse = true
 						rewroteAny = true
 						continue
@@ -503,8 +510,13 @@ func rewriteAnthropicSearchToolResults(body map[string]any) bool {
 			for _, rawBlock := range contentBlocks {
 				block := asMap(rawBlock)
 				if strings.EqualFold(asString(block["type"]), "tool_result") {
-					if _, ok := searchToolUseIDs[asString(block["tool_use_id"])]; ok {
-						rendered := renderAnthropicToolResultAsText(block["content"])
+					rendered := ""
+					if toolUse, ok := searchToolUses[asString(block["tool_use_id"])]; ok {
+						rendered = renderAnthropicToolResultAsText(block["content"], toolUse.Query, searchCache)
+					} else if shouldTreatAsFallbackSearchToolResult(block, toolResultCount, fallbackQuery) {
+						rendered = renderAnthropicToolResultAsText(block["content"], fallbackQuery, searchCache)
+					}
+					if rendered != "" {
 						if rendered != "" {
 							filteredBlocks = append(filteredBlocks, map[string]any{
 								"type": "text",
@@ -531,8 +543,8 @@ func rewriteAnthropicSearchToolResults(body map[string]any) bool {
 	return true
 }
 
-func collectAnthropicSearchToolUseIDs(messages []any) map[string]string {
-	toolUseIDs := make(map[string]string)
+func collectAnthropicSearchToolUses(messages []any) map[string]anthropicSearchToolUse {
+	toolUses := make(map[string]anthropicSearchToolUse)
 	for _, rawMessage := range messages {
 		message := asMap(rawMessage)
 		if !strings.EqualFold(asString(message["role"]), "assistant") {
@@ -548,18 +560,180 @@ func collectAnthropicSearchToolUseIDs(messages []any) map[string]string {
 			if id == "" || !isSearchToolName(name) {
 				continue
 			}
-			toolUseIDs[id] = name
+			toolUses[id] = anthropicSearchToolUse{
+				Query: extractSearchToolQuery(block["input"]),
+			}
 		}
 	}
-	return toolUseIDs
+	return toolUses
 }
 
-func renderAnthropicToolResultAsText(content any) string {
+func extractSearchToolQuery(input any) string {
+	payload := asMap(input)
+	if len(payload) == 0 {
+		return ""
+	}
+	return normalizeFallbackSearchQuery(strings.TrimSpace(firstNonEmpty(
+		asString(payload["query"]),
+		asString(payload["q"]),
+		asString(payload["search_query"]),
+	)))
+}
+
+func countAnthropicToolResults(messages []any) int {
+	count := 0
+	for _, rawMessage := range messages {
+		message := asMap(rawMessage)
+		if !strings.EqualFold(asString(message["role"]), "user") {
+			continue
+		}
+		for _, rawBlock := range asSlice(message["content"]) {
+			block := asMap(rawBlock)
+			if strings.EqualFold(asString(block["type"]), "tool_result") {
+				count++
+			}
+		}
+	}
+	return count
+}
+
+func extractFallbackSearchQuery(messages []any) string {
+	for i := len(messages) - 1; i >= 0; i-- {
+		message := asMap(messages[i])
+		if len(message) == 0 || !strings.EqualFold(asString(message["role"]), "user") {
+			continue
+		}
+		contentBlocks := asSlice(message["content"])
+		if len(contentBlocks) > 0 {
+			onlyToolResult := true
+			for _, rawBlock := range contentBlocks {
+				block := asMap(rawBlock)
+				if !strings.EqualFold(asString(block["type"]), "tool_result") {
+					onlyToolResult = false
+					break
+				}
+			}
+			if onlyToolResult {
+				continue
+			}
+		}
+		query := normalizeFallbackSearchQuery(extractAnthropicMessageText(message["content"]))
+		if query != "" {
+			return query
+		}
+	}
+	return ""
+}
+
+func normalizeFallbackSearchQuery(query string) string {
+	query = strings.TrimSpace(query)
+	lower := strings.ToLower(query)
+	prefixes := []string{
+		"perform a web search for the query:",
+		"perform web search for the query:",
+		"search the web for:",
+	}
+	for _, prefix := range prefixes {
+		if strings.HasPrefix(lower, prefix) {
+			trimmed := strings.TrimSpace(query[len(prefix):])
+			if trimmed != "" {
+				return trimmed
+			}
+		}
+	}
+	return query
+}
+
+func renderAnthropicToolResultAsText(content any, fallbackQuery string, searchCache map[string]string) string {
 	rendered := strings.TrimSpace(renderToolResultContent(content))
+	rendered = sanitizeAnthropicToolResultText(rendered)
+
+	if shouldFallbackSearch(rendered, fallbackQuery) {
+		if cached := strings.TrimSpace(searchCache[fallbackQuery]); cached != "" {
+			debugf("reused cached fallback search results for query=%q", trimForLog(fallbackQuery))
+			return cached
+		}
+		results, err := doSearch(fallbackQuery, pluginConfig.MaxResults)
+		if err != nil {
+			debugf("fallback search failed for query=%q: %v", trimForLog(fallbackQuery), err)
+		} else if len(results) > 0 {
+			rendered = renderSearchResults(fallbackQuery, results)
+			searchCache[fallbackQuery] = rendered
+			debugf("fallback search produced %d results for query=%q", len(results), trimForLog(fallbackQuery))
+			return rendered
+		}
+	}
+
 	if rendered == "" {
 		return ""
 	}
+	if strings.HasPrefix(rendered, pluginConfig.InjectLabel+"\n") || rendered == pluginConfig.InjectLabel {
+		return rendered
+	}
 	return pluginConfig.InjectLabel + "\n" + rendered
+}
+
+func shouldFallbackSearch(rendered, fallbackQuery string) bool {
+	if strings.TrimSpace(fallbackQuery) == "" {
+		return false
+	}
+	if strings.TrimSpace(rendered) == "" {
+		return true
+	}
+	normalized := strings.ToLower(strings.TrimSpace(rendered))
+	switch {
+	case strings.Contains(normalized, "did 0 searches"),
+		strings.Contains(normalized, "did 0 search"),
+		strings.Contains(normalized, "0 searches in"),
+		strings.Contains(normalized, "0 search in"),
+		strings.Contains(normalized, "no search results"),
+		strings.Contains(normalized, "no search result"),
+		strings.Contains(normalized, "no results found"),
+		strings.Contains(normalized, "\"results\":[]"),
+		strings.Contains(normalized, "\"data\":[]"),
+		strings.Contains(normalized, "\"items\":[]"):
+		return true
+	default:
+		return false
+	}
+}
+
+func shouldTreatAsFallbackSearchToolResult(block map[string]any, totalToolResults int, fallbackQuery string) bool {
+	if strings.TrimSpace(fallbackQuery) == "" {
+		return false
+	}
+	rendered := sanitizeAnthropicToolResultText(renderToolResultContent(block["content"]))
+	if shouldFallbackSearch(rendered, fallbackQuery) {
+		return true
+	}
+	return totalToolResults == 1
+}
+
+func sanitizeAnthropicToolResultText(rendered string) string {
+	rendered = strings.TrimSpace(rendered)
+	if rendered == "" {
+		return ""
+	}
+
+	lines := strings.Split(rendered, "\n")
+	filtered := make([]string, 0, len(lines))
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" {
+			if len(filtered) == 0 || filtered[len(filtered)-1] == "" {
+				continue
+			}
+			filtered = append(filtered, "")
+			continue
+		}
+		lower := strings.ToLower(trimmed)
+		if strings.HasPrefix(lower, "did ") && strings.Contains(lower, " search") && strings.Contains(lower, " in ") {
+			continue
+		}
+		filtered = append(filtered, line)
+	}
+
+	return strings.TrimSpace(strings.Join(filtered, "\n"))
 }
 
 func injectSearchResults(path string, body map[string]any, query string, results []searchResult) bool {
