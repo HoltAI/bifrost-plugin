@@ -10,7 +10,6 @@ import (
 	"net/http"
 	"net/url"
 	"reflect"
-	"sort"
 	"strings"
 	"time"
 	"unsafe"
@@ -42,7 +41,6 @@ type searchResult struct {
 }
 
 type anthropicSearchToolUse struct {
-	ID    string
 	Query string
 }
 
@@ -149,12 +147,7 @@ func HTTPTransportPreHook(ctx *schemas.BifrostContext, req *schemas.HTTPRequest)
 			return nil, nil
 		}
 		if !rewriteAnthropicSearchToolResults(body) {
-			debugf(
-				"skipping search tool result rewrite for model=%q path=%s: no matching search tool results; summary=%s",
-				model,
-				req.Path,
-				summarizeAnthropicToolResultState(body),
-			)
+			debugf("skipping search tool result rewrite for model=%q path=%s: no matching search tool results", model, req.Path)
 			return nil, nil
 		}
 		removeSearchTools(req.Path, body)
@@ -479,7 +472,6 @@ func rewriteAnthropicSearchToolResults(body map[string]any) bool {
 	rewrittenMessages := make([]any, 0, len(messages))
 	rewroteAny := false
 	searchCache := make(map[string]string)
-	pendingSearchToolUses := make([]anthropicSearchToolUse, 0)
 	for _, rawMessage := range messages {
 		message := asMap(rawMessage)
 		if len(message) == 0 {
@@ -495,7 +487,6 @@ func rewriteAnthropicSearchToolResults(body map[string]any) bool {
 
 		switch strings.ToLower(strings.TrimSpace(asString(message["role"]))) {
 		case "assistant":
-			pendingSearchToolUses = append(pendingSearchToolUses, extractAnthropicSearchToolUsesFromContent(contentBlocks)...)
 			filteredBlocks := make([]any, 0, len(contentBlocks))
 			removedSearchToolUse := false
 			for _, rawBlock := range contentBlocks {
@@ -515,28 +506,23 @@ func rewriteAnthropicSearchToolResults(body map[string]any) bool {
 			message["content"] = filteredBlocks
 			rewrittenMessages = append(rewrittenMessages, message)
 		case "user":
-			onlyToolResults := anthropicContentHasOnlyToolResults(contentBlocks)
 			filteredBlocks := make([]any, 0, len(contentBlocks))
 			for _, rawBlock := range contentBlocks {
 				block := asMap(rawBlock)
 				if strings.EqualFold(asString(block["type"]), "tool_result") {
 					rendered := ""
 					if toolUse, ok := searchToolUses[asString(block["tool_use_id"])]; ok {
-						pendingSearchToolUses = consumeAnthropicSearchToolUse(pendingSearchToolUses, asString(block["tool_use_id"]))
 						rendered = renderAnthropicToolResultAsText(block["content"], toolUse.Query, searchCache)
-					} else if onlyToolResults {
-						if toolUse, ok := peekAnthropicSearchToolUse(pendingSearchToolUses); ok {
-							pendingSearchToolUses = consumeAnthropicSearchToolUse(pendingSearchToolUses, toolUse.ID)
-							rendered = renderAnthropicToolResultAsText(block["content"], toolUse.Query, searchCache)
-						}
 					} else if shouldTreatAsFallbackSearchToolResult(block, toolResultCount, fallbackQuery) {
 						rendered = renderAnthropicToolResultAsText(block["content"], fallbackQuery, searchCache)
 					}
 					if rendered != "" {
-						filteredBlocks = append(filteredBlocks, map[string]any{
-							"type": "text",
-							"text": rendered,
-						})
+						if rendered != "" {
+							filteredBlocks = append(filteredBlocks, map[string]any{
+								"type": "text",
+								"text": rendered,
+							})
+						}
 						rewroteAny = true
 						continue
 					}
@@ -564,45 +550,20 @@ func collectAnthropicSearchToolUses(messages []any) map[string]anthropicSearchTo
 		if !strings.EqualFold(asString(message["role"]), "assistant") {
 			continue
 		}
-		for _, toolUse := range extractAnthropicSearchToolUsesFromContent(message["content"]) {
-			if toolUse.ID == "" {
+		for _, rawBlock := range asSlice(message["content"]) {
+			block := asMap(rawBlock)
+			if !strings.EqualFold(asString(block["type"]), "tool_use") {
 				continue
 			}
-			toolUses[toolUse.ID] = toolUse
+			name := strings.TrimSpace(asString(block["name"]))
+			id := strings.TrimSpace(asString(block["id"]))
+			if id == "" || !isSearchToolName(name) {
+				continue
+			}
+			toolUses[id] = anthropicSearchToolUse{
+				Query: extractSearchToolQuery(block["input"]),
+			}
 		}
-	}
-	return toolUses
-}
-
-func extractAnthropicSearchToolUsesFromContent(content any) []anthropicSearchToolUse {
-	toolUses := make([]anthropicSearchToolUse, 0)
-	for _, rawBlock := range asSlice(content) {
-		block := asMap(rawBlock)
-		if !strings.EqualFold(asString(block["type"]), "tool_use") {
-			continue
-		}
-		name := strings.TrimSpace(asString(block["name"]))
-		if !isSearchToolName(name) {
-			continue
-		}
-		query := extractSearchToolQuery(block["input"])
-		if query == "" {
-			query = extractSearchToolQuery(block)
-		}
-		if query == "" {
-			debugf(
-				"observed search tool_use without query; name=%q id=%q input_keys=%v block_keys=%v block_summary=%s",
-				name,
-				strings.TrimSpace(asString(block["id"])),
-				sortedMapKeys(asMap(block["input"])),
-				sortedMapKeys(block),
-				trimForLog(renderToolResultContent([]any{block})),
-			)
-		}
-		toolUses = append(toolUses, anthropicSearchToolUse{
-			ID:    strings.TrimSpace(asString(block["id"])),
-			Query: query,
-		})
 	}
 	return toolUses
 }
@@ -616,13 +577,6 @@ func extractSearchToolQuery(input any) string {
 		asString(payload["query"]),
 		asString(payload["q"]),
 		asString(payload["search_query"]),
-		asString(payload["text"]),
-		asString(payload["input"]),
-		asString(payload["arguments"]),
-		asString(payload["raw_input"]),
-		asString(asMap(payload["parameters"])["query"]),
-		asString(asMap(payload["arguments"])["query"]),
-		asString(asMap(payload["raw_input"])["query"]),
 	)))
 }
 
@@ -646,22 +600,22 @@ func countAnthropicToolResults(messages []any) int {
 func extractFallbackSearchQuery(messages []any) string {
 	for i := len(messages) - 1; i >= 0; i-- {
 		message := asMap(messages[i])
-		if len(message) == 0 {
+		if len(message) == 0 || !strings.EqualFold(asString(message["role"]), "user") {
 			continue
 		}
-
-		if query := extractExplicitSearchQueryFromAnthropicContent(message["content"]); query != "" {
-			return query
-		}
-		if query := extractSearchToolQueryFromAnthropicContent(message["content"]); query != "" {
-			return query
-		}
-
-		if !strings.EqualFold(asString(message["role"]), "user") {
-			continue
-		}
-		if anthropicContentHasOnlyToolResults(message["content"]) {
-			continue
+		contentBlocks := asSlice(message["content"])
+		if len(contentBlocks) > 0 {
+			onlyToolResult := true
+			for _, rawBlock := range contentBlocks {
+				block := asMap(rawBlock)
+				if !strings.EqualFold(asString(block["type"]), "tool_result") {
+					onlyToolResult = false
+					break
+				}
+			}
+			if onlyToolResult {
+				continue
+			}
 		}
 		query := normalizeFallbackSearchQuery(extractAnthropicMessageText(message["content"]))
 		if query != "" {
@@ -669,38 +623,6 @@ func extractFallbackSearchQuery(messages []any) string {
 		}
 	}
 	return ""
-}
-
-func extractExplicitSearchQueryFromAnthropicContent(content any) string {
-	text := extractAnthropicMessageText(content)
-	if text == "" {
-		return ""
-	}
-	return extractSearchInvocationQuery(text)
-}
-
-func extractSearchToolQueryFromAnthropicContent(content any) string {
-	toolUses := extractAnthropicSearchToolUsesFromContent(content)
-	for i := len(toolUses) - 1; i >= 0; i-- {
-		if query := strings.TrimSpace(toolUses[i].Query); query != "" {
-			return query
-		}
-	}
-	return ""
-}
-
-func anthropicContentHasOnlyToolResults(content any) bool {
-	contentBlocks := asSlice(content)
-	if len(contentBlocks) == 0 {
-		return false
-	}
-	for _, rawBlock := range contentBlocks {
-		block := asMap(rawBlock)
-		if !strings.EqualFold(asString(block["type"]), "tool_result") {
-			return false
-		}
-	}
-	return true
 }
 
 func normalizeFallbackSearchQuery(query string) string {
@@ -720,65 +642,6 @@ func normalizeFallbackSearchQuery(query string) string {
 		}
 	}
 	return query
-}
-
-func extractSearchInvocationQuery(text string) string {
-	text = strings.ReplaceAll(text, "“", "\"")
-	text = strings.ReplaceAll(text, "”", "\"")
-	text = strings.ReplaceAll(text, "‘", "'")
-	text = strings.ReplaceAll(text, "’", "'")
-	lower := strings.ToLower(text)
-
-	markers := []string{
-		"web search(",
-		"websearch(",
-		"web_search(",
-		"search_web(",
-	}
-	for _, marker := range markers {
-		if idx := strings.LastIndex(lower, marker); idx >= 0 {
-			if query := parseDelimitedQuery(text[idx+len(marker):]); query != "" {
-				return normalizeFallbackSearchQuery(query)
-			}
-		}
-	}
-
-	prefixes := []string{
-		"perform a web search for the query:",
-		"perform web search for the query:",
-		"search the web for:",
-	}
-	for _, prefix := range prefixes {
-		if idx := strings.LastIndex(lower, prefix); idx >= 0 {
-			query := strings.TrimSpace(text[idx+len(prefix):])
-			if query != "" {
-				return normalizeFallbackSearchQuery(query)
-			}
-		}
-	}
-
-	return ""
-}
-
-func parseDelimitedQuery(text string) string {
-	text = strings.TrimSpace(text)
-	if text == "" {
-		return ""
-	}
-
-	if quote := text[0]; quote == '"' || quote == '\'' {
-		for i := 1; i < len(text); i++ {
-			if text[i] == quote && text[i-1] != '\\' {
-				return strings.TrimSpace(text[1:i])
-			}
-		}
-	}
-
-	if idx := strings.IndexByte(text, ')'); idx >= 0 {
-		return strings.TrimSpace(text[:idx])
-	}
-
-	return strings.TrimSpace(text)
 }
 
 func renderAnthropicToolResultAsText(content any, fallbackQuery string, searchCache map[string]string) string {
@@ -844,85 +707,6 @@ func shouldTreatAsFallbackSearchToolResult(block map[string]any, totalToolResult
 		return true
 	}
 	return totalToolResults == 1
-}
-
-func peekAnthropicSearchToolUse(toolUses []anthropicSearchToolUse) (anthropicSearchToolUse, bool) {
-	for _, toolUse := range toolUses {
-		if strings.TrimSpace(toolUse.Query) != "" {
-			return toolUse, true
-		}
-	}
-	return anthropicSearchToolUse{}, false
-}
-
-func consumeAnthropicSearchToolUse(toolUses []anthropicSearchToolUse, id string) []anthropicSearchToolUse {
-	if len(toolUses) == 0 {
-		return toolUses
-	}
-	if strings.TrimSpace(id) != "" {
-		for i, toolUse := range toolUses {
-			if strings.EqualFold(strings.TrimSpace(toolUse.ID), strings.TrimSpace(id)) {
-				return append(toolUses[:i], toolUses[i+1:]...)
-			}
-		}
-	}
-	return toolUses[1:]
-}
-
-func summarizeAnthropicToolResultState(body map[string]any) string {
-	messages := asSlice(body["messages"])
-	if len(messages) == 0 {
-		return "messages=0"
-	}
-
-	summaries := make([]string, 0, 4)
-	for i := len(messages) - 1; i >= 0 && len(summaries) < 4; i-- {
-		message := asMap(messages[i])
-		if len(message) == 0 {
-			continue
-		}
-		role := strings.ToLower(strings.TrimSpace(asString(message["role"])))
-		blockTypes := make([]string, 0, len(asSlice(message["content"])))
-		for _, rawBlock := range asSlice(message["content"]) {
-			block := asMap(rawBlock)
-			blockType := strings.ToLower(strings.TrimSpace(asString(block["type"])))
-			if blockType != "" {
-				blockTypes = append(blockTypes, blockType)
-			}
-		}
-
-		query := firstNonEmpty(
-			extractExplicitSearchQueryFromAnthropicContent(message["content"]),
-			extractSearchToolQueryFromAnthropicContent(message["content"]),
-		)
-		if query != "" {
-			summaries = append(summaries, fmt.Sprintf("%s[%s] query=%q", role, strings.Join(blockTypes, ","), trimForLog(query)))
-			continue
-		}
-		text := extractAnthropicMessageText(message["content"])
-		if text != "" {
-			summaries = append(summaries, fmt.Sprintf("%s[%s] text=%q", role, strings.Join(blockTypes, ","), trimForLog(text)))
-			continue
-		}
-		summaries = append(summaries, fmt.Sprintf("%s[%s]", role, strings.Join(blockTypes, ",")))
-	}
-
-	if len(summaries) == 0 {
-		return "messages-present"
-	}
-	return strings.Join(summaries, " | ")
-}
-
-func sortedMapKeys(value map[string]any) []string {
-	if len(value) == 0 {
-		return nil
-	}
-	keys := make([]string, 0, len(value))
-	for key := range value {
-		keys = append(keys, key)
-	}
-	sort.Strings(keys)
-	return keys
 }
 
 func sanitizeAnthropicToolResultText(rendered string) string {
