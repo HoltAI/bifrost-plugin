@@ -1,5 +1,6 @@
 .DS_Store
 .tmp/
+.build/
 
 plugins/*/build/
 plugins/*/deploy/*.so

@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/sha1"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -20,8 +21,13 @@ import (
 )
 
 const (
-	ctxKeyConverted      = "bifrost_anthropic_kimi_bridge_converted"
-	ctxKeyRequestedModel = "bifrost_anthropic_kimi_bridge_requested_model"
+	ctxKeyConverted        = "bifrost_anthropic_kimi_bridge_converted"
+	ctxKeyRequestedModel   = "bifrost_anthropic_kimi_bridge_requested_model"
+	ctxKeyToolAliasReverse = "bifrost_anthropic_kimi_bridge_tool_alias_reverse"
+
+	maxKimiToolNameLength = 48
+	toolAliasPrefix       = "bfk_"
+	toolAliasHashLength   = 16
 )
 
 type PluginConfig struct {
@@ -38,6 +44,7 @@ type PluginConfig struct {
 
 type anthropicStreamBridgeState struct {
 	requestedModel        string
+	reverseToolNames      map[string]string
 	upstreamMessageID     string
 	upstreamModel         string
 	messageStarted        bool
@@ -200,6 +207,9 @@ func PreLLMHook(ctx *schemas.BifrostContext, req *schemas.BifrostRequest) (*sche
 	chatReq := req.ResponsesRequest.ToChatRequest()
 	chatReq.RawRequestBody = nil
 
+	forwardToolNames, reverseToolNames := buildChatToolAliasMaps(chatReq)
+	applyToolAliasesToChatRequest(chatReq, forwardToolNames)
+
 	req.ChatRequest = chatReq
 	req.ResponsesRequest = nil
 	req.RequestType = schemas.ChatCompletionRequest
@@ -207,6 +217,9 @@ func PreLLMHook(ctx *schemas.BifrostContext, req *schemas.BifrostRequest) (*sche
 	if ctx != nil {
 		ctx.SetValue(ctxKeyConverted, true)
 		ctx.SetValue(ctxKeyRequestedModel, model)
+		if len(reverseToolNames) > 0 {
+			ctx.SetValue(ctxKeyToolAliasReverse, reverseToolNames)
+		}
 	}
 
 	debugf("converted model=%q from responses to chat request", model)
@@ -233,6 +246,7 @@ func PostLLMHook(ctx *schemas.BifrostContext, resp *schemas.BifrostResponse, bif
 		return resp, bifrostErr, nil
 	}
 
+	restoreToolAliasesInChatResponse(resp.ChatResponse, toolAliasReverseFromContext(ctx))
 	responsesResp := resp.ChatResponse.ToBifrostResponsesResponse()
 	if responsesResp == nil {
 		return resp, bifrostErr, nil
@@ -296,7 +310,8 @@ func handleStreamingBridge(ctx *schemas.BifrostContext, req *schemas.HTTPRequest
 		fastCtx.Response.Header.Set("anthropic-version", anthropicVersion)
 	}
 
-	go simulateAnthropicStream(ctx, req, anthropicBody, pipeWriter, requestedModel)
+	forwardToolNames, reverseToolNames := buildAnthropicToolAliasMaps(anthropicBody)
+	go simulateAnthropicStream(ctx, req, anthropicBody, forwardToolNames, reverseToolNames, pipeWriter, requestedModel)
 
 	return &schemas.HTTPResponse{
 		StatusCode: http.StatusOK,
@@ -309,8 +324,8 @@ func handleStreamingBridge(ctx *schemas.BifrostContext, req *schemas.HTTPRequest
 	}, nil
 }
 
-func newInternalChatCompletionsRequest(ctx *schemas.BifrostContext, req *schemas.HTTPRequest, anthropicBody map[string]any) (*http.Request, error) {
-	openAIBody := convertAnthropicMessagesToOpenAI(anthropicBody)
+func newInternalChatCompletionsRequest(ctx *schemas.BifrostContext, req *schemas.HTTPRequest, anthropicBody map[string]any, forwardToolNames map[string]string) (*http.Request, error) {
+	openAIBody := convertAnthropicMessagesToOpenAI(anthropicBody, forwardToolNames)
 
 	payload, err := json.Marshal(openAIBody)
 	if err != nil {
@@ -501,10 +516,10 @@ func headerVirtualKey(req *schemas.HTTPRequest) string {
 	return ""
 }
 
-func simulateAnthropicStream(ctx *schemas.BifrostContext, req *schemas.HTTPRequest, anthropicBody map[string]any, writer *io.PipeWriter, requestedModel string) {
+func simulateAnthropicStream(ctx *schemas.BifrostContext, req *schemas.HTTPRequest, anthropicBody map[string]any, forwardToolNames map[string]string, reverseToolNames map[string]string, writer *io.PipeWriter, requestedModel string) {
 	defer writer.Close()
 
-	httpReq, err := newInternalChatCompletionsRequest(ctx, req, anthropicBody)
+	httpReq, err := newInternalChatCompletionsRequest(ctx, req, anthropicBody, forwardToolNames)
 	if err != nil {
 		emitAnthropicStreamError(writer, fmt.Sprintf("failed to build internal chat request: %v", err))
 		return
@@ -544,7 +559,7 @@ func simulateAnthropicStream(ctx *schemas.BifrostContext, req *schemas.HTTPReque
 		return
 	}
 
-	anthropicPayload := convertOpenAIChatPayloadToAnthropicPayload(payload, requestedModel)
+	anthropicPayload := convertOpenAIChatPayloadToAnthropicPayload(payload, requestedModel, reverseToolNames)
 	if len(anthropicPayload) == 0 {
 		emitAnthropicStreamError(writer, "failed to convert internal chat response to anthropic payload")
 		return
@@ -582,7 +597,7 @@ func parseUpstreamErrorPayload(bodyBytes []byte, statusCode int) map[string]any 
 	}
 }
 
-func convertOpenAIChatPayloadToAnthropicPayload(payload map[string]any, requestedModel string) map[string]any {
+func convertOpenAIChatPayloadToAnthropicPayload(payload map[string]any, requestedModel string, reverseToolNames map[string]string) map[string]any {
 	if len(payload) == 0 {
 		return nil
 	}
@@ -623,7 +638,7 @@ func convertOpenAIChatPayloadToAnthropicPayload(payload map[string]any, requeste
 		contentBlocks = append(contentBlocks, map[string]any{
 			"type":  "tool_use",
 			"id":    firstNonEmpty(asString(toolCall["id"]), "call_"+compactUUID(24)),
-			"name":  asString(function["name"]),
+			"name":  restoreToolName(asString(function["name"]), reverseToolNames),
 			"input": input,
 		})
 	}
@@ -819,7 +834,7 @@ func normalizeAnthropicSystem(systemValue any) []string {
 	}
 }
 
-func convertAnthropicMessagesToOpenAI(body map[string]any) map[string]any {
+func convertAnthropicMessagesToOpenAI(body map[string]any, forwardToolNames map[string]string) map[string]any {
 	openAIMessages := make([]map[string]any, 0)
 
 	systemParts := normalizeAnthropicSystem(body["system"])
@@ -878,7 +893,7 @@ func convertAnthropicMessagesToOpenAI(body map[string]any) map[string]any {
 						"id":   callID,
 						"type": "function",
 						"function": map[string]any{
-							"name":      asString(block["name"]),
+							"name":      aliasToolName(asString(block["name"]), forwardToolNames),
 							"arguments": string(arguments),
 						},
 					})
@@ -968,10 +983,10 @@ func convertAnthropicMessagesToOpenAI(body map[string]any) map[string]any {
 		openAIBody["stop"] = stop
 	}
 
-	tools := convertAnthropicToolsToOpenAI(body["tools"])
+	tools := convertAnthropicToolsToOpenAI(body["tools"], forwardToolNames)
 	if len(tools) > 0 {
 		openAIBody["tools"] = tools
-		if toolChoice := normalizeOpenAIToolChoice(body["tool_choice"]); toolChoice != nil {
+		if toolChoice := normalizeOpenAIToolChoice(body["tool_choice"], forwardToolNames); toolChoice != nil {
 			openAIBody["tool_choice"] = toolChoice
 		}
 	}
@@ -979,7 +994,7 @@ func convertAnthropicMessagesToOpenAI(body map[string]any) map[string]any {
 	return openAIBody
 }
 
-func convertAnthropicToolsToOpenAI(tools any) []map[string]any {
+func convertAnthropicToolsToOpenAI(tools any, forwardToolNames map[string]string) []map[string]any {
 	rawTools := asSlice(tools)
 	if len(rawTools) == 0 {
 		return nil
@@ -1002,7 +1017,7 @@ func convertAnthropicToolsToOpenAI(tools any) []map[string]any {
 		converted = append(converted, map[string]any{
 			"type": "function",
 			"function": map[string]any{
-				"name":        name,
+				"name":        aliasToolName(name, forwardToolNames),
 				"description": asString(tool["description"]),
 				"parameters":  parameters,
 			},
@@ -1011,7 +1026,7 @@ func convertAnthropicToolsToOpenAI(tools any) []map[string]any {
 	return converted
 }
 
-func normalizeOpenAIToolChoice(toolChoice any) any {
+func normalizeOpenAIToolChoice(toolChoice any, forwardToolNames map[string]string) any {
 	switch value := toolChoice.(type) {
 	case nil:
 		return nil
@@ -1039,11 +1054,17 @@ func normalizeOpenAIToolChoice(toolChoice any) any {
 			return map[string]any{
 				"type": "function",
 				"function": map[string]any{
-					"name": name,
+					"name": aliasToolName(name, forwardToolNames),
 				},
 			}
 		case "function":
-			return value
+			cloned := cloneMap(value)
+			function := cloneMap(asMap(cloned["function"]))
+			if len(function) > 0 {
+				function["name"] = aliasToolName(asString(function["name"]), forwardToolNames)
+				cloned["function"] = function
+			}
+			return cloned
 		default:
 			return nil
 		}
@@ -1057,8 +1078,9 @@ func bridgeOpenAIStreamToAnthropic(upstreamBody io.ReadCloser, writer *io.PipeWr
 	defer writer.Close()
 
 	state := &anthropicStreamBridgeState{
-		requestedModel: requestedModel,
-		toolBlocks:     make(map[int]*toolBlockState),
+		requestedModel:   requestedModel,
+		reverseToolNames: nil,
+		toolBlocks:       make(map[int]*toolBlockState),
 	}
 
 	scanner := bufio.NewScanner(upstreamBody)
@@ -1224,7 +1246,7 @@ func emitAnthropicToolDelta(writer *io.PipeWriter, state *anthropicStreamBridgeS
 	}
 	function := asMap(toolCall["function"])
 	if name := asString(function["name"]); name != "" {
-		block.name = name
+		block.name = restoreToolName(name, state.reverseToolNames)
 	}
 
 	if !block.started {
@@ -1578,12 +1600,21 @@ func requestedModelFromContext(ctx *schemas.BifrostContext) string {
 	return model
 }
 
+func toolAliasReverseFromContext(ctx *schemas.BifrostContext) map[string]string {
+	if ctx == nil {
+		return nil
+	}
+	reverse, _ := ctx.Value(ctxKeyToolAliasReverse).(map[string]string)
+	return reverse
+}
+
 func clearConversionState(ctx *schemas.BifrostContext) {
 	if ctx == nil {
 		return
 	}
 	ctx.ClearValue(ctxKeyConverted)
 	ctx.ClearValue(ctxKeyRequestedModel)
+	ctx.ClearValue(ctxKeyToolAliasReverse)
 }
 
 func jsonResponse(statusCode int, payload any) *schemas.HTTPResponse {
@@ -1617,6 +1648,262 @@ func cloneMap(value map[string]any) map[string]any {
 		cloned[key] = item
 	}
 	return cloned
+}
+
+func buildAnthropicToolAliasMaps(body map[string]any) (map[string]string, map[string]string) {
+	toolNames := make([]string, 0)
+	appendAnthropicToolNames(&toolNames, body)
+	return buildToolAliasMaps(toolNames)
+}
+
+func appendAnthropicToolNames(toolNames *[]string, body map[string]any) {
+	if len(body) == 0 {
+		return
+	}
+	for _, rawTool := range asSlice(body["tools"]) {
+		tool := asMap(rawTool)
+		if len(tool) == 0 {
+			continue
+		}
+		appendToolName(toolNames, asString(tool["name"]))
+	}
+	appendAnthropicToolChoiceNames(toolNames, body["tool_choice"])
+	for _, rawMessage := range asSlice(body["messages"]) {
+		message := asMap(rawMessage)
+		if len(message) == 0 || asString(message["role"]) != "assistant" {
+			continue
+		}
+		for _, rawBlock := range asSlice(message["content"]) {
+			block := asMap(rawBlock)
+			if len(block) == 0 || asString(block["type"]) != "tool_use" {
+				continue
+			}
+			appendToolName(toolNames, asString(block["name"]))
+		}
+	}
+}
+
+func appendAnthropicToolChoiceNames(toolNames *[]string, toolChoice any) {
+	value := asMap(toolChoice)
+	if len(value) == 0 {
+		return
+	}
+	switch asString(value["type"]) {
+	case "tool":
+		appendToolName(toolNames, asString(value["name"]))
+	case "function":
+		appendToolName(toolNames, asString(asMap(value["function"])["name"]))
+	}
+}
+
+func buildChatToolAliasMaps(req *schemas.BifrostChatRequest) (map[string]string, map[string]string) {
+	if req == nil {
+		return nil, nil
+	}
+	toolNames := make([]string, 0)
+	if req.Params != nil {
+		for _, tool := range req.Params.Tools {
+			if tool.Function != nil {
+				appendToolName(&toolNames, tool.Function.Name)
+			}
+		}
+		appendChatToolChoiceNames(&toolNames, req.Params.ToolChoice)
+	}
+	for _, message := range req.Input {
+		if message.ChatAssistantMessage == nil {
+			continue
+		}
+		for _, toolCall := range message.ChatAssistantMessage.ToolCalls {
+			if toolCall.Function.Name != nil {
+				appendToolName(&toolNames, *toolCall.Function.Name)
+			}
+		}
+	}
+	return buildToolAliasMaps(toolNames)
+}
+
+func appendChatToolChoiceNames(toolNames *[]string, toolChoice *schemas.ChatToolChoice) {
+	if toolChoice == nil || toolChoice.ChatToolChoiceStruct == nil {
+		return
+	}
+	switch toolChoice.ChatToolChoiceStruct.Type {
+	case schemas.ChatToolChoiceTypeFunction:
+		if toolChoice.ChatToolChoiceStruct.Function != nil {
+			appendToolName(toolNames, toolChoice.ChatToolChoiceStruct.Function.Name)
+		}
+	case schemas.ChatToolChoiceTypeCustom:
+		if toolChoice.ChatToolChoiceStruct.Custom != nil {
+			appendToolName(toolNames, toolChoice.ChatToolChoiceStruct.Custom.Name)
+		}
+	case schemas.ChatToolChoiceTypeAllowedTools:
+		if toolChoice.ChatToolChoiceStruct.AllowedTools == nil {
+			return
+		}
+		for _, tool := range toolChoice.ChatToolChoiceStruct.AllowedTools.Tools {
+			appendToolName(toolNames, tool.Function.Name)
+		}
+	}
+}
+
+func appendToolName(toolNames *[]string, name string) {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return
+	}
+	*toolNames = append(*toolNames, name)
+}
+
+func buildToolAliasMaps(toolNames []string) (map[string]string, map[string]string) {
+	if len(toolNames) == 0 {
+		return nil, nil
+	}
+	reserved := make(map[string]struct{}, len(toolNames))
+	uniqueNames := make([]string, 0, len(toolNames))
+	seen := make(map[string]struct{}, len(toolNames))
+	for _, name := range toolNames {
+		name = strings.TrimSpace(name)
+		if name == "" {
+			continue
+		}
+		reserved[name] = struct{}{}
+		if _, ok := seen[name]; ok {
+			continue
+		}
+		seen[name] = struct{}{}
+		uniqueNames = append(uniqueNames, name)
+	}
+
+	forward := make(map[string]string)
+	reverse := make(map[string]string)
+	for _, name := range uniqueNames {
+		if len(name) <= maxKimiToolNameLength {
+			continue
+		}
+		alias := compactToolAlias(name, reserved, reverse)
+		forward[name] = alias
+		reverse[alias] = name
+		reserved[alias] = struct{}{}
+	}
+	if len(reverse) == 0 {
+		return nil, nil
+	}
+	return forward, reverse
+}
+
+func compactToolAlias(name string, reserved map[string]struct{}, reverse map[string]string) string {
+	hash := compactHash(name, toolAliasHashLength)
+	base := toolAliasPrefix + hash
+	alias := base
+	suffix := 1
+	for {
+		if _, taken := reserved[alias]; !taken {
+			if existing, ok := reverse[alias]; !ok || existing == name {
+				return alias
+			}
+		}
+		alias = fmt.Sprintf("%s_%d", base, suffix)
+		suffix++
+	}
+}
+
+func aliasToolName(name string, forward map[string]string) string {
+	name = strings.TrimSpace(name)
+	if name == "" || len(forward) == 0 {
+		return name
+	}
+	if alias, ok := forward[name]; ok {
+		return alias
+	}
+	return name
+}
+
+func restoreToolName(name string, reverse map[string]string) string {
+	name = strings.TrimSpace(name)
+	if name == "" || len(reverse) == 0 {
+		return name
+	}
+	if original, ok := reverse[name]; ok {
+		return original
+	}
+	return name
+}
+
+func applyToolAliasesToChatRequest(req *schemas.BifrostChatRequest, forward map[string]string) {
+	if req == nil || len(forward) == 0 {
+		return
+	}
+	if req.Params != nil {
+		for i := range req.Params.Tools {
+			if req.Params.Tools[i].Function != nil {
+				req.Params.Tools[i].Function.Name = aliasToolName(req.Params.Tools[i].Function.Name, forward)
+			}
+		}
+		if req.Params.ToolChoice != nil && req.Params.ToolChoice.ChatToolChoiceStruct != nil {
+			switch req.Params.ToolChoice.ChatToolChoiceStruct.Type {
+			case schemas.ChatToolChoiceTypeFunction:
+				if req.Params.ToolChoice.ChatToolChoiceStruct.Function != nil {
+					req.Params.ToolChoice.ChatToolChoiceStruct.Function.Name = aliasToolName(req.Params.ToolChoice.ChatToolChoiceStruct.Function.Name, forward)
+				}
+			case schemas.ChatToolChoiceTypeCustom:
+				if req.Params.ToolChoice.ChatToolChoiceStruct.Custom != nil {
+					req.Params.ToolChoice.ChatToolChoiceStruct.Custom.Name = aliasToolName(req.Params.ToolChoice.ChatToolChoiceStruct.Custom.Name, forward)
+				}
+			case schemas.ChatToolChoiceTypeAllowedTools:
+				if req.Params.ToolChoice.ChatToolChoiceStruct.AllowedTools != nil {
+					for i := range req.Params.ToolChoice.ChatToolChoiceStruct.AllowedTools.Tools {
+						req.Params.ToolChoice.ChatToolChoiceStruct.AllowedTools.Tools[i].Function.Name = aliasToolName(req.Params.ToolChoice.ChatToolChoiceStruct.AllowedTools.Tools[i].Function.Name, forward)
+					}
+				}
+			}
+		}
+	}
+	for i := range req.Input {
+		message := &req.Input[i]
+		if message.ChatAssistantMessage == nil {
+			continue
+		}
+		for j := range message.ChatAssistantMessage.ToolCalls {
+			if message.ChatAssistantMessage.ToolCalls[j].Function.Name == nil {
+				continue
+			}
+			aliased := aliasToolName(*message.ChatAssistantMessage.ToolCalls[j].Function.Name, forward)
+			message.ChatAssistantMessage.ToolCalls[j].Function.Name = schemas.Ptr(aliased)
+		}
+	}
+}
+
+func restoreToolAliasesInChatResponse(resp *schemas.BifrostChatResponse, reverse map[string]string) {
+	if resp == nil || len(reverse) == 0 {
+		return
+	}
+	for i := range resp.Choices {
+		choice := &resp.Choices[i]
+		if choice.ChatNonStreamResponseChoice != nil && choice.ChatNonStreamResponseChoice.Message != nil {
+			restoreToolAliasesInChatMessage(choice.ChatNonStreamResponseChoice.Message, reverse)
+		}
+		if choice.ChatStreamResponseChoice != nil && choice.ChatStreamResponseChoice.Delta != nil {
+			for j := range choice.ChatStreamResponseChoice.Delta.ToolCalls {
+				if choice.ChatStreamResponseChoice.Delta.ToolCalls[j].Function.Name == nil {
+					continue
+				}
+				restored := restoreToolName(*choice.ChatStreamResponseChoice.Delta.ToolCalls[j].Function.Name, reverse)
+				choice.ChatStreamResponseChoice.Delta.ToolCalls[j].Function.Name = schemas.Ptr(restored)
+			}
+		}
+	}
+}
+
+func restoreToolAliasesInChatMessage(message *schemas.ChatMessage, reverse map[string]string) {
+	if message == nil || message.ChatAssistantMessage == nil {
+		return
+	}
+	for i := range message.ChatAssistantMessage.ToolCalls {
+		if message.ChatAssistantMessage.ToolCalls[i].Function.Name == nil {
+			continue
+		}
+		restored := restoreToolName(*message.ChatAssistantMessage.ToolCalls[i].Function.Name, reverse)
+		message.ChatAssistantMessage.ToolCalls[i].Function.Name = schemas.Ptr(restored)
+	}
 }
 
 func maskSensitiveList(values []string) []string {
@@ -1695,6 +1982,15 @@ func anyToStringSlice(value any) []string {
 
 func compactUUID(length int) string {
 	value := strings.ReplaceAll(uuid.NewString(), "-", "")
+	if length > 0 && length < len(value) {
+		return value[:length]
+	}
+	return value
+}
+
+func compactHash(text string, length int) string {
+	sum := sha1.Sum([]byte(text))
+	value := fmt.Sprintf("%x", sum)
 	if length > 0 && length < len(value) {
 		return value[:length]
 	}
