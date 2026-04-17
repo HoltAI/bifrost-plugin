@@ -17,6 +17,7 @@ import (
 	"unsafe"
 
 	"github.com/google/uuid"
+	"github.com/maximhq/bifrost/core/providers/openai"
 	"github.com/maximhq/bifrost/core/schemas"
 	"github.com/valyala/fasthttp"
 )
@@ -558,7 +559,11 @@ func HTTPTransportPreHook(ctx *schemas.BifrostContext, req *schemas.HTTPRequest)
 	if !strings.EqualFold(req.Method, http.MethodPost) {
 		return nil, nil
 	}
-	if normalizePath(req.Path) != "/anthropic/v1/messages" {
+	path := normalizePath(req.Path)
+	if isOpenAIResponsesPath(path) {
+		return handleOpenAIResponsesHTTPBridge(ctx, req)
+	}
+	if path != "/anthropic/v1/messages" {
 		return nil, nil
 	}
 
@@ -590,6 +595,82 @@ func HTTPTransportPreHook(ctx *schemas.BifrostContext, req *schemas.HTTPRequest)
 
 	debugf("handling simulated stream bridge for model=%q path=%s", model, req.Path)
 	return handleStreamingBridge(ctx, req, body, model, identityRule)
+}
+
+func handleOpenAIResponsesHTTPBridge(ctx *schemas.BifrostContext, req *schemas.HTTPRequest) (*schemas.HTTPResponse, error) {
+	var openAIReq openai.OpenAIResponsesRequest
+	if err := json.Unmarshal(req.Body, &openAIReq); err != nil {
+		return jsonResponse(http.StatusBadRequest, map[string]any{
+			"type": "error",
+			"error": map[string]any{
+				"type":    "invalid_request_error",
+				"message": fmt.Sprintf("invalid JSON body: %v", err),
+			},
+		}), nil
+	}
+
+	requestedModel := strings.TrimSpace(openAIReq.Model)
+	if !shouldBridgeRequest(ctx, req, requestedModel) {
+		debugf("skipping OpenAI responses HTTP hook for model=%q path=%s", requestedModel, req.Path)
+		return nil, nil
+	}
+
+	if openAIReq.Stream == nil || !*openAIReq.Stream {
+		debugf("allowing non-stream OpenAI responses request to continue via LLM hook for model=%q path=%s", requestedModel, req.Path)
+		return nil, nil
+	}
+
+	bifrostReq := openAIReq.ToBifrostResponsesRequest(ctx)
+	if bifrostReq == nil {
+		return jsonResponse(http.StatusBadRequest, map[string]any{
+			"type": "error",
+			"error": map[string]any{
+				"type":    "invalid_request_error",
+				"message": "failed to convert responses request",
+			},
+		}), nil
+	}
+
+	chatReq := bifrostReq.ToChatRequest()
+	chatReq.RawRequestBody = nil
+
+	identityRule := matchIdentityRule(ctx, req, req.Path, requestedModel)
+	if identityRule != nil {
+		applyIdentityPromptToChatRequest(chatReq, *identityRule)
+	}
+
+	forwardToolNames, reverseToolNames := buildChatToolAliasMaps(chatReq)
+	applyToolAliasesToChatRequest(chatReq, forwardToolNames)
+
+	fastCtx, ok := extractFastHTTPContext(ctx)
+	if !ok || fastCtx == nil {
+		return jsonResponse(http.StatusInternalServerError, map[string]any{
+			"type": "error",
+			"error": map[string]any{
+				"type":    "api_error",
+				"message": "responses stream bridge requires HTTP transport context",
+			},
+		}), nil
+	}
+
+	pipeReader, pipeWriter := io.Pipe()
+	fastCtx.SetContentType("text/event-stream")
+	fastCtx.Response.Header.Set("Cache-Control", "no-cache")
+	fastCtx.Response.Header.Set("Connection", "keep-alive")
+	fastCtx.Response.Header.Set("Access-Control-Allow-Origin", "*")
+	fastCtx.Response.SetBodyStream(pipeReader, -1)
+
+	go simulateOpenAIResponsesStream(ctx, req, chatReq, reverseToolNames, pipeWriter, requestedModel, identityRule)
+
+	return &schemas.HTTPResponse{
+		StatusCode: http.StatusOK,
+		Headers: map[string]string{
+			"content-type":                "text/event-stream",
+			"cache-control":               "no-cache",
+			"connection":                  "keep-alive",
+			"access-control-allow-origin": "*",
+		},
+	}, nil
 }
 
 func HTTPTransportPostHook(ctx *schemas.BifrostContext, req *schemas.HTTPRequest, resp *schemas.HTTPResponse) error {
@@ -716,6 +797,15 @@ func streamUnsupportedError(req *schemas.BifrostResponsesRequest) *schemas.Bifro
 	}
 }
 
+func isOpenAIResponsesPath(path string) bool {
+	switch normalizePath(path) {
+	case "/openai/v1/responses", "/v1/responses", "/responses", "/openai/responses":
+		return true
+	default:
+		return false
+	}
+}
+
 func handleStreamingBridge(ctx *schemas.BifrostContext, req *schemas.HTTPRequest, anthropicBody map[string]any, requestedModel string, identityRule *IdentityRule) (*schemas.HTTPResponse, error) {
 	fastCtx, ok := extractFastHTTPContext(ctx)
 	if !ok || fastCtx == nil {
@@ -833,7 +923,31 @@ func handleNonStreamingBridge(ctx *schemas.BifrostContext, req *schemas.HTTPRequ
 
 func newInternalChatCompletionsRequest(ctx *schemas.BifrostContext, req *schemas.HTTPRequest, anthropicBody map[string]any, forwardToolNames map[string]string) (*http.Request, error) {
 	openAIBody := convertAnthropicMessagesToOpenAI(anthropicBody, forwardToolNames)
+	return newInternalChatCompletionsRequestFromBody(ctx, req, openAIBody)
+}
 
+func newInternalChatCompletionsRequestFromChatRequest(ctx *schemas.BifrostContext, req *schemas.HTTPRequest, chatReq *schemas.BifrostChatRequest) (*http.Request, error) {
+	if chatReq == nil {
+		return nil, fmt.Errorf("chat request is nil")
+	}
+
+	openAIReq := openai.ToOpenAIChatRequest(ctx, chatReq)
+	if openAIReq == nil {
+		return nil, fmt.Errorf("failed to convert chat request to openai format")
+	}
+
+	payload, err := json.Marshal(openAIReq)
+	if err != nil {
+		return nil, err
+	}
+	var openAIBody map[string]any
+	if err := json.Unmarshal(payload, &openAIBody); err != nil {
+		return nil, err
+	}
+	return newInternalChatCompletionsRequestFromBody(ctx, req, openAIBody)
+}
+
+func newInternalChatCompletionsRequestFromBody(ctx *schemas.BifrostContext, req *schemas.HTTPRequest, openAIBody map[string]any) (*http.Request, error) {
 	payload, err := json.Marshal(openAIBody)
 	if err != nil {
 		return nil, err
@@ -1101,6 +1215,75 @@ func simulateAnthropicStream(ctx *schemas.BifrostContext, req *schemas.HTTPReque
 	}
 }
 
+func simulateOpenAIResponsesStream(ctx *schemas.BifrostContext, req *schemas.HTTPRequest, chatReq *schemas.BifrostChatRequest, reverseToolNames map[string]string, writer *io.PipeWriter, requestedModel string, identityRule *IdentityRule) {
+	defer writer.Close()
+
+	httpReq, err := newInternalChatCompletionsRequestFromChatRequest(ctx, req, chatReq)
+	if err != nil {
+		emitOpenAIResponsesStreamError(writer, fmt.Sprintf("failed to build internal chat request: %v", err))
+		return
+	}
+
+	upstreamResp, err := httpClient.Do(httpReq)
+	if err != nil {
+		emitOpenAIResponsesStreamError(writer, fmt.Sprintf("internal chat request failed: %v", err))
+		return
+	}
+	defer upstreamResp.Body.Close()
+
+	bodyBytes, err := io.ReadAll(upstreamResp.Body)
+	if err != nil {
+		emitOpenAIResponsesStreamError(writer, fmt.Sprintf("failed to read internal responses bridge body: %v", err))
+		return
+	}
+
+	if upstreamResp.StatusCode >= 400 {
+		payload := parseUpstreamErrorPayload(bodyBytes, upstreamResp.StatusCode)
+		if err := emitOpenAIResponsesSSE(writer, string(schemas.ResponsesStreamResponseTypeError), payload); err != nil {
+			emitOpenAIResponsesStreamError(writer, err.Error())
+		}
+		return
+	}
+
+	var chatResp schemas.BifrostChatResponse
+	if err := json.Unmarshal(bodyBytes, &chatResp); err != nil {
+		emitOpenAIResponsesStreamError(writer, fmt.Sprintf("failed to parse internal chat response: %v", err))
+		return
+	}
+
+	restoreToolAliasesInChatResponse(&chatResp, reverseToolNames)
+
+	effectiveRule := identityRule
+	if effectiveRule == nil {
+		effectiveRule = matchIdentityRule(ctx, req, req.Path, firstNonEmpty(requestedModel, chatReq.Model, chatResp.Model))
+	}
+	if effectiveRule != nil {
+		rewriteChatResponse(&chatResp, requestedModel, *effectiveRule)
+	} else if strings.TrimSpace(requestedModel) != "" {
+		chatResp.Model = requestedModel
+	}
+
+	events := convertChatResponseToResponsesStreamEvents(&chatResp)
+	if len(events) == 0 {
+		emitOpenAIResponsesStreamError(writer, "internal chat request returned an empty response")
+		return
+	}
+
+	for _, event := range events {
+		if event == nil {
+			continue
+		}
+		payload := event.WithDefaults()
+		if payload == nil {
+			continue
+		}
+		if err := emitOpenAIResponsesSSE(writer, string(event.Type), payload); err != nil {
+			emitOpenAIResponsesStreamError(writer, err.Error())
+			return
+		}
+	}
+}
+
 func parseUpstreamErrorPayload(bodyBytes []byte, statusCode int) map[string]any {
 	if len(bodyBytes) > 0 {
 		var payload map[string]any
@@ -1322,6 +1505,166 @@ func streamAnthropicPayload(writer *io.PipeWriter, payload map[string]any, reque
 	}
 	return emitAnthropicSSE(writer, "message_stop", map[string]any{
 		"type": "message_stop",
+	})
+}
+
+func convertChatResponseToResponsesStreamEvents(chatResp *schemas.BifrostChatResponse) []*schemas.BifrostResponsesStreamResponse {
+	if chatResp == nil || len(chatResp.Choices) == 0 {
+		return nil
+	}
+
+	choice := chatResp.Choices[0]
+	if choice.ChatNonStreamResponseChoice == nil || choice.ChatNonStreamResponseChoice.Message == nil {
+		return nil
+	}
+
+	message := choice.ChatNonStreamResponseChoice.Message
+	state := schemas.AcquireChatToResponsesStreamState()
+	defer schemas.ReleaseChatToResponsesStreamState(state)
+
+	var chunks []*schemas.BifrostChatResponse
+	role := string(schemas.ChatMessageRoleAssistant)
+	chunks = append(chunks, &schemas.BifrostChatResponse{
+		ID:    chatResp.ID,
+		Model: chatResp.Model,
+		Usage: chatResp.Usage,
+		Choices: []schemas.BifrostResponseChoice{{
+			Index: 0,
+			ChatStreamResponseChoice: &schemas.ChatStreamResponseChoice{
+				Delta: &schemas.ChatStreamResponseChoiceDelta{Role: &role},
+			},
+		}},
+		ExtraFields: chatResp.ExtraFields,
+	})
+
+	if text := strings.TrimSpace(chatMessageText(message)); text != "" {
+		textCopy := text
+		chunks = append(chunks, &schemas.BifrostChatResponse{
+			ID:    chatResp.ID,
+			Model: chatResp.Model,
+			Choices: []schemas.BifrostResponseChoice{{
+				Index: 0,
+				ChatStreamResponseChoice: &schemas.ChatStreamResponseChoice{
+					Delta: &schemas.ChatStreamResponseChoiceDelta{Content: &textCopy},
+				},
+			}},
+			ExtraFields: chatResp.ExtraFields,
+		})
+	}
+
+	if message.ChatAssistantMessage != nil && message.Reasoning != nil && strings.TrimSpace(*message.Reasoning) != "" {
+		reasoning := strings.TrimSpace(*message.Reasoning)
+		chunks = append(chunks, &schemas.BifrostChatResponse{
+			ID:    chatResp.ID,
+			Model: chatResp.Model,
+			Choices: []schemas.BifrostResponseChoice{{
+				Index: 0,
+				ChatStreamResponseChoice: &schemas.ChatStreamResponseChoice{
+					Delta: &schemas.ChatStreamResponseChoiceDelta{Reasoning: &reasoning},
+				},
+			}},
+			ExtraFields: chatResp.ExtraFields,
+		})
+	}
+
+	if message.ChatAssistantMessage != nil && message.Refusal != nil && strings.TrimSpace(*message.Refusal) != "" {
+		refusal := strings.TrimSpace(*message.Refusal)
+		chunks = append(chunks, &schemas.BifrostChatResponse{
+			ID:    chatResp.ID,
+			Model: chatResp.Model,
+			Choices: []schemas.BifrostResponseChoice{{
+				Index: 0,
+				ChatStreamResponseChoice: &schemas.ChatStreamResponseChoice{
+					Delta: &schemas.ChatStreamResponseChoiceDelta{Refusal: &refusal},
+				},
+			}},
+			ExtraFields: chatResp.ExtraFields,
+		})
+	}
+
+	if message.ChatAssistantMessage != nil {
+		for _, toolCall := range message.ToolCalls {
+			toolCallCopy := toolCall
+			chunks = append(chunks, &schemas.BifrostChatResponse{
+				ID:    chatResp.ID,
+				Model: chatResp.Model,
+				Choices: []schemas.BifrostResponseChoice{{
+					Index: 0,
+					ChatStreamResponseChoice: &schemas.ChatStreamResponseChoice{
+						Delta: &schemas.ChatStreamResponseChoiceDelta{ToolCalls: []schemas.ChatAssistantMessageToolCall{toolCallCopy}},
+					},
+				}},
+				ExtraFields: chatResp.ExtraFields,
+			})
+		}
+	}
+
+	finishReason := firstNonEmpty(asString(choice.FinishReason), inferFinishReason(message))
+	chunks = append(chunks, &schemas.BifrostChatResponse{
+		ID:    chatResp.ID,
+		Model: chatResp.Model,
+		Usage: chatResp.Usage,
+		Choices: []schemas.BifrostResponseChoice{{
+			Index:        0,
+			FinishReason: &finishReason,
+			ChatStreamResponseChoice: &schemas.ChatStreamResponseChoice{
+				Delta: &schemas.ChatStreamResponseChoiceDelta{},
+			},
+		}},
+		ExtraFields: chatResp.ExtraFields,
+	})
+
+	var events []*schemas.BifrostResponsesStreamResponse
+	for _, chunk := range chunks {
+		events = append(events, chunk.ToBifrostResponsesStreamResponse(state)...)
+	}
+	return events
+}
+
+func inferFinishReason(message *schemas.ChatMessage) string {
+	if message != nil && message.ChatAssistantMessage != nil && len(message.ToolCalls) > 0 {
+		return string(schemas.BifrostFinishReasonToolCalls)
+	}
+	return string(schemas.BifrostFinishReasonStop)
+}
+
+func chatMessageText(message *schemas.ChatMessage) string {
+	if message == nil || message.Content == nil {
+		return ""
+	}
+	if message.Content.ContentStr != nil {
+		if text := strings.TrimSpace(*message.Content.ContentStr); text != "" {
+			return text
+		}
+	}
+	if len(message.Content.ContentBlocks) == 0 {
+		return ""
+	}
+	var parts []string
+	for _, block := range message.Content.ContentBlocks {
+		if block.Text != nil && strings.TrimSpace(*block.Text) != "" {
+			parts = append(parts, strings.TrimSpace(*block.Text))
+		}
+	}
+	return strings.TrimSpace(strings.Join(parts, "\n"))
+}
+
+func emitOpenAIResponsesSSE(writer *io.PipeWriter, eventType string, payload any) error {
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+	_, err = fmt.Fprintf(writer, "event: %s\ndata: %s\n\n", eventType, data)
+	return err
+}
+
+func emitOpenAIResponsesStreamError(writer *io.PipeWriter, message string) {
+	_ = emitOpenAIResponsesSSE(writer, string(schemas.ResponsesStreamResponseTypeError), map[string]any{
+		"type": "error",
+		"error": map[string]any{
+			"type":    "api_error",
+			"message": message,
+		},
 	})
 }
 
